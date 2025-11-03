@@ -13,7 +13,6 @@ def lte_rt(adata: AtomicData, wave, dz, temperature, ne, nhtot, vz, vturb):
     I = nearest_fs(dz, eta, chi)
     return I
 
-
 if __name__ == "__main__":
     import lightweaver as lw
     from lightweaver.fal import Falc82
@@ -42,43 +41,6 @@ if __name__ == "__main__":
     vz = jnp.zeros(temperature.shape[0])
 
     waves = jnp.linspace(lw.air_to_vac(630.1), lw.air_to_vac(630.3), 201)
-
-    # emis_opac_atmos = jax.vmap(
-    #     emis_opac,
-    #     in_axes=[None, None, 0, 0, 0, 0, 0]
-    # )
-    # emis_opac_wave_atmos = jax.jit(jax.vmap(
-    #     emis_opac_atmos,
-    #     in_axes=[None, 0, None, None, None, None, None]
-    # ))
-
-    # eta, chi = emis_opac_wave_atmos(lines, waves, temperature, ne, nhtot, vz, vturb)
-    # fig, ax = plt.subplots(1, 2)
-    # ax[0].imshow(eta.T, norm='log', aspect='auto')
-    # ax[1].imshow(chi.T, norm='log', aspect='auto')
-
-    # emis_opac_response = jax.jit(jax.vmap(
-    #     jax.vmap(
-    #         jax.jacrev(
-    #             emis_opac,
-    #             argnums=(2, 3, 4, 5, 6),
-    #         ),
-    #         in_axes=[None, None, 0, 0, 0, 0, 0]
-    #     ),
-    #     in_axes=[None, 0, None, None, None, None, None]
-    # ))
-
-    # grads = emis_opac_response(lines, waves, temperature, ne, nhtot, vz, vturb)
-    # detadT = grads[0][0]
-    # detadne = grads[0][1]
-    # detadnhtot = grads[0][2]
-    # detadvz = grads[0][3]
-    # detadvt = grads[0][4]
-    # dchidT = grads[1][0]
-    # dchidne = grads[1][1]
-    # dchidnhtot = grads[1][2]
-    # dchidvz = grads[1][3]
-    # dchidvt = grads[1][4]
 
     lte_rt_wave = jax.jit(
         jax.vmap(
@@ -131,4 +93,5 @@ if __name__ == "__main__":
     ax[1, 1].set_title('dI / dvturb')
     fig.colorbar(mappable, ax=ax[1, 1])
 
-
+    fig.savefig('blah.png')
+    plt.close()
