@@ -26,6 +26,7 @@ class PINNDora_MLP:
         self.params = self.init_params(layer_sizes, key)
         self.optimizer = optax.adam(learning_rate=lr)
         self.opt_state = self.optimizer.init(self.params)
+        self.loss_and_grad = jax.value_and_grad(self.mse_loss, argnums=2)
 
     def init_params(self, layer_sizes, key):
         """
@@ -108,22 +109,27 @@ class PINNDora_MLP:
     def mse_loss(self, x, I_obs, params):
         temperature_corr, ne_corr, nhtot_corr, vz_corr, vturb_corr = self.forward(x, params=params)
         print(temperature_corr.shape)
-        # breakpoint()
-        self.t_temperature = self.temperature * (1 + jnp.reshape(temperature_corr, (-1, 82)))
-        self.t_nhtot       = self.nhtot       * (1 + jnp.reshape(nhtot_corr, (-1, 82)))
-        self.t_vz          = self.vz          * (1 + jnp.reshape(vz_corr, (-1, 82)))
-        self.t_ne          = self.ne          * (1 + jnp.reshape(ne_corr, (-1, 82)))
-        self.t_vturb       = self.vturb       * (1 + jnp.reshape(vturb_corr, (-1, 82)))
+        t_temperature = self.temperature * (1 + jnp.reshape(temperature_corr, (-1, 82)))
+        t_nhtot       = self.nhtot       * (1 + jnp.reshape(nhtot_corr, (-1, 82)))
+        t_vz          = self.vz          * (1 + jnp.reshape(vz_corr, (-1, 82)))
+        t_ne          = self.ne          * (1 + jnp.reshape(ne_corr, (-1, 82)))
+        t_vturb       = self.vturb       * (1 + jnp.reshape(vturb_corr, (-1, 82)))
 
         # print(f"temp 1: {temperature[1, ...]}")
         self.I_synthetic = self.compute_lte_rt_3D(
-            self.t_temperature,
-            self.t_ne,
-            self.t_nhtot,
-            self.t_vz,
-            self.t_vturb)
+            t_temperature,
+            t_ne,
+            t_nhtot,
+            t_vz,
+            t_vturb)
         # print(f"Isynth shape: {I_synthetic.shape}")
         print(jnp.mean(self.I_synthetic))
+
+        self.t_temperature = t_temperature
+        self.t_nhtot = t_nhtot
+        self.t_vz = t_vz
+        self.t_ne = t_ne
+        self.t_vturb = t_vturb
 
         # return jnp.mean(I_synthetic)
         return jnp.mean((self.I_synthetic - I_obs[0, ...]) ** 2)
@@ -138,17 +144,12 @@ class PINNDora_MLP:
         return loss_value
 
     def _train_step(self, params, opt_state, x, y, optimizer, loss_fn):
-        def loss_function(params):
-            return loss_fn(x, y, self.params)  # Make params explicit in loss_fn
-
         # Compute loss and gradients
-        # loss_value, grads = jax.value_and_grad(loss_fn)(x, y)
-        loss_value = self.mse_loss(x, y, params)
-        grads = jax.grad(loss_function)(params)
-        # breakpoint()
+        loss_value, grads = self.loss_and_grad(x, y, params)
+        # loss_value = self.mse_loss(x, y, params)
+        # grads = jax.grad(loss_function)(params)
         # Update parameters using the optimizer
         print(f"Params after update: {params['layer_2']['w'][0:3, 0:3]}")
-        breakpoint()
         updates, opt_state = optimizer.update(grads, opt_state, params)
 
         params = optax.apply_updates(params, updates)

@@ -4,8 +4,15 @@ from jax import random
 import numpy as np
 from lightweaver.fal import Falc82
 from lineop import read_kurucz
+import matplotlib.pyplot as plt
 
 from PINN_machinery import PINNDora_MLP
+
+try:
+    get_ipython().run_line_magic("matplotlib", "")
+except:
+    plt.ion()
+
 
 lines = read_kurucz("kurucz_6301_6302.linelist")
 fal = Falc82()
@@ -40,7 +47,7 @@ dz = jnp.array(
 
 waves = jnp.linspace(lw.air_to_vac(630.1), lw.air_to_vac(630.3), 201)
 
-learning_rate = 1e-1
+learning_rate = 1e-3
 num_epochs = 1000
 output_dim = 5
 layer_sizes = [3, 64, 64, 64, output_dim]
@@ -50,9 +57,27 @@ key = random.PRNGKey(0)
 model = PINNDora_MLP(layer_sizes, key, waves, lines, dz, fal,
                      lr=learning_rate)
 
+# def test_fn(p):
+#     temperature_corr, ne_corr, nhtot_corr, vz_corr, vturb_corr = model.forward(xyz_flat, params=p)
+#     t_temperature = model.temperature * (1 + jnp.reshape(temperature_corr, (-1, 82)))
+#     t_nhtot       = model.nhtot       * (1 + jnp.reshape(nhtot_corr, (-1, 82)))
+#     t_vz          = model.vz          * (1 + jnp.reshape(vz_corr, (-1, 82)))
+#     t_ne          = model.ne          * (1 + jnp.reshape(ne_corr, (-1, 82)))
+#     t_vturb       = model.vturb       * (1 + jnp.reshape(vturb_corr, (-1, 82)))
+
+#     # # print(f"temp 1: {temperature[1, ...]}")
+#     I_synthetic = model.compute_lte_rt_3D(
+#         t_temperature,
+#         t_ne,
+#         t_nhtot,
+#         t_vz,
+#         t_vturb)
+
+#     return jnp.mean((I_synthetic - spectrum.squeeze())**2)
+
 model.train(xyz_flat, spectrum, num_epochs)
 
 
-# Testing
+# # Testing
 x_test = jnp.linspace(-1, 1, 100).reshape(-1, 1)
 y_pred = model.predict(x_test)
