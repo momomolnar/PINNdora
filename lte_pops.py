@@ -1,5 +1,6 @@
+import adora_precision
+adora_precision.configure_precision()
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import astropy.constants as const
 
@@ -15,48 +16,52 @@ def lte_pops(
     ne,
     ntot,
 ):
-    n_level = energy.shape[0]
+    """Return normalized LTE level populations.
+
+    Parameters use SI units except for ``energy``, which is in eV.  ``g`` is
+    the statistical weight and ``stage`` is an integer ionization-stage index.
+    Temperature, electron density, statistical weights, and total population
+    must be positive (``ntot`` may also be zero).
+
+    Relative Saha--Boltzmann weights are normalized in log space so highly
+    ionized or weakly populated levels do not overflow before normalization.
+    """
+    energy = jnp.asarray(energy)
+    g = jnp.asarray(g)
+    stage = jnp.asarray(stage)
+    if energy.ndim != 1 or energy.size == 0:
+        raise ValueError("energy must be a non-empty one-dimensional array")
+    if g.shape != energy.shape or stage.shape != energy.shape:
+        raise ValueError("energy, g, and stage must have identical shapes")
+
     k_B_T = temperature * K_B_EV
-    saha_term = 0.5 * ne * (DEBROGLIE_CONST / temperature)**(1.5)
-
-    pops = jnp.empty((n_level))
-
-    sum = 1.0
-    for i in range(1, n_level):
-        dE = energy[i] - energy[0]
-        gi0 = g[i] / g[0]
-        dZ = stage[i] - stage[0]
-
-        dE_kBT = dE / k_B_T
-        pop_i = gi0 * jnp.exp(-dE_kBT)
-        pop_i /= saha_term**dZ
-        sum += pop_i
-        pops = pops.at[i].set(pop_i)
-
-    pop_0 = ntot / sum
-    pops = pops.at[0].set(pop_0)
-
-    for i in range(1, n_level):
-        pop_i = pops[i] * pop_0
-        pops = pops.at[i].set(pop_i)
-    return pops
+    log_saha_term = (
+        jnp.log(0.5)
+        + jnp.log(ne)
+        + 1.5 * (jnp.log(DEBROGLIE_CONST) - jnp.log(temperature))
+    )
+    log_weights = (
+        jnp.log(g) - jnp.log(g[0])
+        - (energy - energy[0]) / k_B_T
+        - (stage - stage[0]) * log_saha_term
+    )
+    log_norm = jax.scipy.special.logsumexp(log_weights)
+    return ntot * jnp.exp(log_weights - log_norm)
 
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    try:
-        get_ipython().run_line_magic("matplotlib", "")
-    except:
-        plt.ion()
     import lightweaver as lw
     from lightweaver.rh_atoms import CaII_atom, H_6_atom
     from lightweaver.fal import Falc82
     import astropy.units as u
 
     Ca = CaII_atom()
-    energies = jnp.array([(l.E_SI << u.Unit("J")).to("eV").value for l in Ca.levels])
-    gs = jnp.array([l.g for l in Ca.levels])
-    stages = jnp.array([l.stage + 1 for l in Ca.levels]) # à la crtaf/dexrt, but it won't matter here since we only look at stage differences
+    energies = jnp.array([
+        (level.E_SI << u.Unit("J")).to("eV").value for level in Ca.levels
+    ])
+    gs = jnp.array([level.g for level in Ca.levels])
+    stages = jnp.array([level.stage + 1 for level in Ca.levels])
 
     fal = Falc82()
 
@@ -86,17 +91,24 @@ if __name__ == "__main__":
     temperature_resp = nstar_response[0]
     ne_resp = nstar_response[1]
 
-    fal_pert = Falc82()
-    ne_pert = fal.ne * 1e-10
-    temp_pert = fal.temperature * 0.01
-    fal_pert.ne += ne_pert
-    eq_pops_pert = rad_set.compute_eq_pops(fal_pert)
-    ne_resp_fd = (eq_pops_pert['Ca'] - eq_pops['Ca']) / ne_pert
+    ne_pert = fal.ne * 1e-5
+    temp_pert = fal.temperature * 1e-4
 
-    fal_pert.ne -= ne_pert
-    fal_pert.temperature += temp_pert
-    eq_pops_pert = rad_set.compute_eq_pops(fal_pert)
-    temperature_resp_fd = (eq_pops_pert['Ca'] - eq_pops['Ca']) / temp_pert
+    fal_ne_plus = Falc82()
+    fal_ne_minus = Falc82()
+    fal_ne_plus.ne += ne_pert
+    fal_ne_minus.ne -= ne_pert
+    ne_plus = rad_set.compute_eq_pops(fal_ne_plus).atomicPops["Ca"].nStar
+    ne_minus = rad_set.compute_eq_pops(fal_ne_minus).atomicPops["Ca"].nStar
+    ne_resp_fd = (ne_plus - ne_minus) / (2.0 * ne_pert)
+
+    fal_temp_plus = Falc82()
+    fal_temp_minus = Falc82()
+    fal_temp_plus.temperature += temp_pert
+    fal_temp_minus.temperature -= temp_pert
+    temp_plus = rad_set.compute_eq_pops(fal_temp_plus).atomicPops["Ca"].nStar
+    temp_minus = rad_set.compute_eq_pops(fal_temp_minus).atomicPops["Ca"].nStar
+    temperature_resp_fd = (temp_plus - temp_minus) / (2.0 * temp_pert)
 
     plt.figure()
 

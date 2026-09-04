@@ -1,20 +1,44 @@
+from adora_precision import REAL_DTYPE
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import astropy.constants as const
 import astropy.units as u
+import numpy as np
 
-HC = const.h.value * const.c.value
-NM_TO_M = u.Unit('nm').to('m')
-M_TO_NM = u.Unit('m').to('nm')
-E_RYD = const.Ryd.to('J', equivalencies=u.spectral()).value
-Q_ELE = u.eV.to(u.J)
-EPS_0 = const.eps0.value
-M_ELE = const.m_e.value
-K_B = const.k_B.value
-H_CROSS_SECTION_C0 = 32.0 / (3.0 * jnp.sqrt(3.0)) * (Q_ELE / jnp.sqrt(4.0 * jnp.pi * EPS_0))**2 / (M_ELE * const.c.value) * const.h.value / (2.0 * E_RYD)
+
+def _real(value):
+    return jnp.asarray(value, dtype=REAL_DTYPE)
+
+
+HC = _real(const.h.value * const.c.value)
+NM_TO_M = _real(u.Unit('nm').to('m'))
+M_TO_NM = _real(u.Unit('m').to('nm'))
+E_RYD = _real(const.Ryd.to('J', equivalencies=u.spectral()).value)
+E_RYD_OVER_K_B = _real(
+    const.Ryd.to('J', equivalencies=u.spectral()).value / const.k_B.value
+)
+HC_OVER_E_RYD_NM = _real(
+    const.h.value
+    * const.c.value
+    / const.Ryd.to('J', equivalencies=u.spectral()).value
+    * float(u.Unit('m').to('nm'))
+)
+Q_ELE = _real(u.eV.to(u.J))
+EPS_0 = _real(const.eps0.value)
+M_ELE = _real(const.m_e.value)
+K_B = _real(const.k_B.value)
+H_CROSS_SECTION_C0 = _real(
+    32.0
+    / (3.0 * np.sqrt(3.0))
+    * (float(u.eV.to(u.J)) / np.sqrt(4.0 * np.pi * const.eps0.value)) ** 2
+    / (const.m_e.value * const.c.value)
+    * const.h.value
+    / (2.0 * const.Ryd.to('J', equivalencies=u.spectral()).value)
+)
 N_H_CONT = 5
-SAHA_CONST = ((2 * jnp.pi * const.m_e.value * const.k_B.value) / const.h.value**2)**1.5
+SAHA_CONST = _real(
+    ((2 * np.pi * const.m_e.value * const.k_B.value) / const.h.value**2) ** 1.5
+)
 
 def gaunt_bf(wvl, nEff, charge) -> float:
     '''
@@ -36,7 +60,7 @@ def gaunt_bf(wvl, nEff, charge) -> float:
         Gaunt factor for bound-free transitions.
     '''
     # /* --- M. J. Seaton (1960), Rep. Prog. Phys. 23, 313 -- ----------- */
-    x = HC / (wvl * NM_TO_M) / (E_RYD * charge**2)
+    x = HC_OVER_E_RYD_NM / (wvl * charge**2)
     x3 = x**(1.0/3.0)
     nsqx = 1.0 / (nEff**2 * x)
 
@@ -53,13 +77,13 @@ def h_bf_cont(wvl, i):
 
     Z = 1.0
     n = i + 1
-    lambda_edge = HC * n**2 / E_RYD * M_TO_NM
+    lambda_edge = HC_OVER_E_RYD_NM * n**2
     alpha0 = H_CROSS_SECTION_C0 * n * gaunt_bf(lambda_edge, n, 1.0)
     gbf0 = gaunt_bf(lambda_edge, n, Z)
     gbf = gaunt_bf(wvl, n, Z)
     alpha = jnp.where(
-        wvl < lambda_edge,
-        alpha0 * gbf / gbf0 * (wvl / lambda_edge)**2,
+        wvl <= lambda_edge,
+        alpha0 * gbf / gbf0 * (wvl / lambda_edge)**3,
         0.0
     )
     return alpha
@@ -114,13 +138,14 @@ def hminus_bf_gray(wvl, temperature, ne, nhi):
     """
 
     wvl_a = wvl * 10.0
-    alpha = 0.1199654 + (-1.18267e-6 + (2.64243e-7 + (-4.40524e-11 + (3.23992e-15 + (-1.39568e-19 + 2.78701e-24 * wvl_a) * wvl_a) * wvl_a) * wvl_a) * wvl_a) * wvl_a
+    # Wishart's cross-section fit, in units of 1e-18 cm2 per H- ion.
+    alpha = 1.99654 + (-1.18267e-5 + (2.64243e-6 + (-4.40524e-10 + (3.23992e-14 + (-1.39568e-18 + 2.78701e-23 * wvl_a) * wvl_a) * wvl_a) * wvl_a) * wvl_a) * wvl_a
     p_e = ne * K_B * temperature * 10 # dyn/cm2
     theta = 5040.0 / temperature
 
     sigma = jnp.where(
         (wvl > 150.0) & (wvl < 1605.0),
-        4.158e-10 * alpha * 1e-17 * p_e * theta**(2.5) * 10 ** (0.754 * theta) * (nhi * 1e-6),
+        4.158e-10 * alpha * 1e-18 * p_e * theta**(2.5) * 10 ** (0.754 * theta) * (nhi * 1e-6),
         0.0
     ) # in cm-1
     return sigma * 1e2
@@ -137,9 +162,17 @@ def lte_h_ion_fracs(temperature, ne, nhtot):
     Computes nhi and nhii for the given point
     """
     # 2 g_hii / g_hi = 1
-    saha = SAHA_CONST * temperature**1.5 * jnp.exp(-E_RYD / (K_B * temperature))
-    nhi = nhtot / (1.0 + saha / ne)
-    nhii = nhtot - nhi
+    log_ratio = (
+        jnp.log(SAHA_CONST)
+        + 1.5 * jnp.log(temperature)
+        - E_RYD_OVER_K_B / temperature
+        - jnp.log(ne)
+    )
+    # Computing nhii as nhtot - nhi erases the ionized population when the gas
+    # is weakly ionized.  Logistic fractions remain accurate in both tails and
+    # sum to nhtot without subtracting nearly equal large numbers.
+    nhi = nhtot * jax.nn.sigmoid(-log_ratio)
+    nhii = nhtot * jax.nn.sigmoid(log_ratio)
     return nhi, nhii
 
 def continuum_opacity(wvl, temperature, ne, nhtot):
@@ -155,16 +188,22 @@ def continuum_opacity(wvl, temperature, ne, nhtot):
 
     Computes the continuum opacity in m-1
     """
-    stimulated_correction = (1.0 - 10 ** (-1.2398e3*5040 / (wvl * temperature)))
-    nhi, nhii = lte_h_ion_fracs(temperature, ne, nhtot)
+    stimulated_exponent = (
+        -1.2398e3 * 5040.0 * jnp.log(10.0) / (wvl * temperature)
+    )
+    stimulated_correction = -jnp.expm1(stimulated_exponent)
+    nhi, _ = lte_h_ion_fracs(temperature, ne, nhtot)
 
     abs_h_bf = 0.0
     for i in range(0, N_H_CONT):
         n = i + 1
-        dE_kT = E_RYD / (n**2 * K_B * temperature)
-        saha_const = SAHA_CONST * temperature**1.5
-        saha_term = ne * nhii / saha_const * jnp.exp(dE_kT)
-        pop = n**2 * saha_term
+        # Algebraically equivalent to the level-specific Saha expression, but
+        # referenced to stable neutral-H population.  In particular the n=1
+        # population is exactly nhi even when nhii is vanishingly small.
+        excitation_over_kT = (
+            E_RYD_OVER_K_B * (1.0 - 1.0 / n**2) / temperature
+        )
+        pop = nhi * n**2 * jnp.exp(-excitation_over_kT)
         abs_h_bf = abs_h_bf + h_bf_cont(wvl, i) * pop
 
     abs_hm_bf = hminus_bf_gray(wvl, temperature, ne, nhi)
@@ -176,9 +215,14 @@ if __name__ == "__main__":
 
     import matplotlib.pyplot as plt
     try:
-        get_ipython().run_line_magic("matplotlib", "")
-    except:
+        from IPython import get_ipython
+        ipython = get_ipython()
+    except ImportError:
+        ipython = None
+    if ipython is None:
         plt.ion()
+    else:
+        ipython.run_line_magic("matplotlib", "")
 
     plt.figure()
 

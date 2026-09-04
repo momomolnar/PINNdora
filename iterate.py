@@ -1,10 +1,13 @@
+import adora_precision
+adora_precision.configure_precision()
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from lineop import AtomicData, read_kurucz
+from adora_data import FE_I_6301_6302_LINE_LIST
+from atmosphere import atmosphere_from_falc
+from lineop import read_kurucz
 from response_fn import lte_rt
 import jaxopt
-from jaxopt import GaussNewton, LevenbergMarquardt
+from jaxopt import LevenbergMarquardt
 # NOTE(cmo): Didn't have much success with optimistix, even after downgrading jax to 0.6.2 to work around a bug
 # https://github.com/jax-ml/jax/issues/31448
 # https://github.com/patrick-kidger/optimistix/issues/151
@@ -13,7 +16,7 @@ from jaxopt import GaussNewton, LevenbergMarquardt
 # response functions. We may need our own
 
 def pack_params(temperature, ne, nhtot, vz, vturb):
-    return np.stack([
+    return jnp.stack([
         temperature,
         ne,
         nhtot,
@@ -22,6 +25,9 @@ def pack_params(temperature, ne, nhtot, vz, vturb):
     ]).reshape(-1)
 
 def params_to_tuple(params):
+    params = jnp.asarray(params)
+    if params.ndim != 1 or params.shape[0] % 5 != 0:
+        raise ValueError("params must be a one-dimensional array with length divisible by 5")
     p = params.reshape(5, -1)
     return (
         p[0],
@@ -30,6 +36,62 @@ def params_to_tuple(params):
         p[3],
         p[4],
     )
+
+
+def physical_to_unconstrained(params):
+    """Map physical atmospheric parameters to finite optimizer coordinates.
+
+    Temperature, densities, velocity, and microturbulence are mapped onto the
+    same conservative bounds used by the bounded SciPy example.  Densities are
+    transformed logarithmically because their useful ranges span many orders
+    of magnitude.
+    """
+    temperature, ne, nhtot, vz, vturb = params_to_tuple(params)
+    dtype = jnp.result_type(params, jnp.float32)
+    eps = jnp.asarray(1e-6, dtype=dtype)
+
+    def logit(fraction):
+        fraction = jnp.clip(fraction, eps, 1.0 - eps)
+        return jnp.log(fraction) - jnp.log1p(-fraction)
+
+    def bounded(value, lower, upper):
+        return logit((value - lower) / (upper - lower))
+
+    def log_bounded(value, lower, upper):
+        safe_value = jnp.clip(value, lower, upper)
+        fraction = (jnp.log(safe_value) - jnp.log(lower)) / (
+            jnp.log(upper) - jnp.log(lower)
+        )
+        return logit(fraction)
+
+    return pack_params(
+        bounded(temperature, 2.5e3, 100e3),
+        log_bounded(ne, 1e16, 1e22),
+        log_bounded(nhtot, 1e16, 1e24),
+        bounded(vz, -20e3, 20e3),
+        bounded(vturb, 0.0, 20e3),
+    )
+
+
+def unconstrained_to_physical(params):
+    """Decode optimizer coordinates into a finite, physically valid atmosphere."""
+    temperature, ne, nhtot, vz, vturb = params_to_tuple(params)
+
+    def bounded(value, lower, upper):
+        return lower + (upper - lower) * jax.nn.sigmoid(value)
+
+    def log_bounded(value, lower, upper):
+        log_value = bounded(value, jnp.log(lower), jnp.log(upper))
+        return jnp.exp(log_value)
+
+    return pack_params(
+        bounded(temperature, 2.5e3, 100e3),
+        log_bounded(ne, 1e16, 1e22),
+        log_bounded(nhtot, 1e16, 1e24),
+        bounded(vz, -20e3, 20e3),
+        bounded(vturb, 0.0, 20e3),
+    )
+
 
 lte_rt_jit = jax.jit(
         lte_rt,
@@ -55,6 +117,11 @@ def compute_residuals(params, target, lines, wavelengths, dz):
 
     model = lte_rt_wave(lines, wavelengths, dz, temperature, ne, nhtot, vz, vturb)
     return model - target
+
+
+def compute_residuals_unconstrained(params, target, lines, wavelengths, dz):
+    physical_params = unconstrained_to_physical(params)
+    return compute_residuals(physical_params, target, lines, wavelengths, dz)
 
 def vmap_residuals(params, target, lines, wavelength, dz):
     params = params.reshape(5, -1)
@@ -91,29 +158,21 @@ compute_residuals_jac_vmap = jax.jit(
 if __name__ == "__main__":
     import lightweaver as lw
     from lightweaver.fal import Falc82
-    import numpy as np
     import matplotlib.pyplot as plt
     try:
-        get_ipython().run_line_magic("matplotlib", "")
-    except:
+        from IPython import get_ipython
+        ipython = get_ipython()
+    except ImportError:
+        ipython = None
+    if ipython is None:
         plt.ion()
+    else:
+        ipython.run_line_magic("matplotlib", "")
 
-    lines = read_kurucz("kurucz_6301_6302.linelist")
+    lines = read_kurucz(FE_I_6301_6302_LINE_LIST)
 
     fal = Falc82()
-    dz = jnp.array(
-        np.concatenate(
-            [
-                [fal.z[::-1][0] - fal.z[::-1][1]],
-                fal.z[::-1][1:] - fal.z[::-1][:-1]
-            ]
-        )
-    )
-    temperature = jnp.array(fal.temperature[::-1])
-    ne = jnp.array(fal.ne[::-1])
-    nhtot = jnp.array(fal.nHTot[::-1])
-    vturb = jnp.array(fal.vturb[::-1])
-    vz = jnp.zeros(temperature.shape[0])
+    _, dz, temperature, ne, nhtot, vz, vturb = atmosphere_from_falc(fal)
 
     temperature_target = temperature.copy()
     temperature_target = temperature_target + jnp.sin(jnp.linspace(0.0, 6.0 * jnp.pi, temperature.shape[0])) * 400
@@ -143,10 +202,12 @@ if __name__ == "__main__":
     plt.plot(waves, start)
     plt.plot(waves, target)
 
+    initial_unconstrained = physical_to_unconstrained(initial_params)
     solver = LevenbergMarquardt(
-        residual_fun=jax.jit(compute_residuals_vmap),
+        residual_fun=jax.jit(compute_residuals_unconstrained),
         solver=jaxopt.linear_solve.solve_cg,
     )
-    result = solver.run(initial_params, target, lines, waves, dz)
+    result = solver.run(initial_unconstrained, target, lines, waves, dz)
+    fitted_params = unconstrained_to_physical(result.params)
 
-    plt.plot(waves, lte_rt_wave(lines, waves, dz, *params_to_tuple(result.params)), '--')
+    plt.plot(waves, lte_rt_wave(lines, waves, dz, *params_to_tuple(fitted_params)), '--')

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Generated demo/training artifacts
+data/*.npz
+figures/
+*.png

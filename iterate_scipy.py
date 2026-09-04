@@ -1,12 +1,15 @@
+import adora_precision
+adora_precision.configure_precision()
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from lineop import AtomicData, read_kurucz
+from adora_data import FE_I_6301_6302_LINE_LIST
+from atmosphere import atmosphere_from_falc
+from lineop import read_kurucz
 from response_fn import lte_rt
 from scipy.optimize import least_squares
 
 def pack_params(temperature, ne, nhtot, vz, vturb):
-    return np.stack([
+    return jnp.stack([
         temperature,
         ne,
         nhtot,
@@ -15,6 +18,9 @@ def pack_params(temperature, ne, nhtot, vz, vturb):
     ]).reshape(-1)
 
 def params_to_tuple(params):
+    params = jnp.asarray(params)
+    if params.ndim != 1 or params.shape[0] % 5 != 0:
+        raise ValueError("params must be a one-dimensional array with length divisible by 5")
     p = params.reshape(5, -1)
     return (
         p[0],
@@ -88,26 +94,19 @@ if __name__ == "__main__":
     import numpy as np
     import matplotlib.pyplot as plt
     try:
-        get_ipython().run_line_magic("matplotlib", "")
-    except:
+        from IPython import get_ipython
+        ipython = get_ipython()
+    except ImportError:
+        ipython = None
+    if ipython is None:
         plt.ion()
+    else:
+        ipython.run_line_magic("matplotlib", "")
 
-    lines = read_kurucz("kurucz_6301_6302.linelist")
+    lines = read_kurucz(FE_I_6301_6302_LINE_LIST)
 
     fal = Falc82()
-    dz = jnp.array(
-        np.concatenate(
-            [
-                [fal.z[::-1][0] - fal.z[::-1][1]],
-                fal.z[::-1][1:] - fal.z[::-1][:-1]
-            ]
-        )
-    )
-    temperature = jnp.array(fal.temperature[::-1])
-    ne = jnp.array(fal.ne[::-1])
-    nhtot = jnp.array(fal.nHTot[::-1])
-    vturb = jnp.array(fal.vturb[::-1])
-    vz = jnp.zeros(temperature.shape[0])
+    _, dz, temperature, ne, nhtot, vz, vturb = atmosphere_from_falc(fal)
 
     temperature_target = temperature.copy()
     temperature_target = temperature_target + jnp.sin(jnp.linspace(0.0, 6.0 * jnp.pi, temperature.shape[0])) * 400

@@ -1,18 +1,100 @@
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-from lineop import AtomicData, read_kurucz, emis_opac_polarised, planck
-from vector_formal_solver import delo_constant_fs
+from time import perf_counter
 
-def lte_polarised_rt(adata: AtomicData, wave, dz, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b):
+import adora_precision
+adora_precision.configure_precision()
+import jax
+import jax.numpy as jnp
+
+from adora_data import FE_I_6301_6302_LINE_LIST
+from atmosphere import atmosphere_from_falc
+from lineop import AtomicData, read_kurucz, emis_opac_polarised, planck
+from vector_formal_solver import delo_constant_fs, delo_constant_fs_nonsingular
+
+
+def _lte_polarised_rt(
+    formal_solver,
+    adata: AtomicData,
+    wave,
+    dz,
+    temperature,
+    ne,
+    nhtot,
+    vz,
+    vturb,
+    b,
+    gamma_b,
+    chi_b,
+):
     eta, chi = jax.vmap(
         emis_opac_polarised,
         in_axes=[None, None, 0, 0, 0, 0, 0, 0, 0, 0]
     )(adata, wave, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b)
 
-    I_start = jnp.array([planck(wave, temperature[0]), 0.0, 0.0, 0.0])
-    I = delo_constant_fs(dz, I_start, eta, chi)
+    I_start = jnp.zeros(4, dtype=eta.dtype).at[0].set(planck(wave, temperature[0]))
+    I = formal_solver(dz, I_start, eta, chi)
     return I
+
+
+def lte_polarised_rt(
+    adata: AtomicData,
+    wave,
+    dz,
+    temperature,
+    ne,
+    nhtot,
+    vz,
+    vturb,
+    b,
+    gamma_b,
+    chi_b,
+):
+    """Polarized LTE synthesis with the robust singular-opacity fallback."""
+
+    return _lte_polarised_rt(
+        delo_constant_fs,
+        adata,
+        wave,
+        dz,
+        temperature,
+        ne,
+        nhtot,
+        vz,
+        vturb,
+        b,
+        gamma_b,
+        chi_b,
+    )
+
+
+def lte_polarised_rt_nonsingular(
+    adata: AtomicData,
+    wave,
+    dz,
+    temperature,
+    ne,
+    nhtot,
+    vz,
+    vturb,
+    b,
+    gamma_b,
+    chi_b,
+):
+    """Fast polarized LTE synthesis when Stokes-I opacity is nonzero."""
+
+    return _lte_polarised_rt(
+        delo_constant_fs_nonsingular,
+        adata,
+        wave,
+        dz,
+        temperature,
+        ne,
+        nhtot,
+        vz,
+        vturb,
+        b,
+        gamma_b,
+        chi_b,
+    )
 
 
 if __name__ == "__main__":
@@ -21,26 +103,19 @@ if __name__ == "__main__":
     import numpy as np
     import matplotlib.pyplot as plt
     try:
-        get_ipython().run_line_magic("matplotlib", "")
-    except:
+        from IPython import get_ipython
+        ipython = get_ipython()
+    except ImportError:
+        ipython = None
+    if ipython is None:
         plt.ion()
+    else:
+        ipython.run_line_magic("matplotlib", "")
 
-    lines = read_kurucz("kurucz_6301_6302.linelist")
+    lines = read_kurucz(FE_I_6301_6302_LINE_LIST)
 
     fal = Falc82()
-    dz = jnp.array(
-        np.concatenate(
-            [
-                [fal.z[::-1][0] - fal.z[::-1][1]],
-                fal.z[::-1][1:] - fal.z[::-1][:-1]
-            ]
-        )
-    )
-    temperature = jnp.array(fal.temperature[::-1])
-    ne = jnp.array(fal.ne[::-1])
-    nhtot = jnp.array(fal.nHTot[::-1])
-    vturb = jnp.array(fal.vturb[::-1])
-    vz = jnp.zeros(temperature.shape[0])
+    _, dz, temperature, ne, nhtot, vz, vturb = atmosphere_from_falc(fal)
     b = jnp.ones(temperature.shape[0]) * 0.05
     # gamma_b = jnp.zeros(temperature.shape[0])
     # ~ 45 degrees
@@ -51,7 +126,7 @@ if __name__ == "__main__":
 
     lte_rt_wave = jax.jit(
         jax.vmap(
-            lte_polarised_rt,
+            lte_polarised_rt_nonsingular,
             in_axes=[None, 0, None, None, None, None, None, None, None, None, None],
             out_axes=1,
         )
@@ -80,17 +155,33 @@ if __name__ == "__main__":
     plt.plot(waves, Iquv_lw[3] / Iquv_lw[0, 0], '--', label="V Lw")
     plt.legend()
 
+    response_start = perf_counter()
     lte_polarised_rt_response = jax.jit(
         jax.vmap(
             jax.jacrev(
-                lte_polarised_rt,
+                lte_polarised_rt_nonsingular,
                 argnums=(3, 4, 5, 6, 7, 8, 9, 10),
             ),
             in_axes=[None, 0, None, None, None, None, None, None, None, None, None],
             out_axes=1,
         )
     )
-    resp = lte_polarised_rt_response(lines, waves, dz, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b)
+    resp = lte_polarised_rt_response(
+        lines, waves, dz, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b
+    )
+    jax.block_until_ready(resp)
+    response_elapsed = perf_counter() - response_start
+    print(
+        "Response-function first call (JIT compilation + evaluation): "
+        f"{response_elapsed:.3f} s"
+    )
+    cached_start = perf_counter()
+    resp = lte_polarised_rt_response(
+        lines, waves, dz, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b
+    )
+    jax.block_until_ready(resp)
+    cached_elapsed = perf_counter() - cached_start
+    print(f"Response-function cached evaluation: {cached_elapsed:.3f} s")
     # dIdT = resp[0]
     # dIdne = resp[1]
     # dIdnhtot = resp[2]
@@ -120,5 +211,3 @@ if __name__ == "__main__":
     # mappable = ax[1, 1].imshow(dIdvt.T, aspect='auto', vmin=-m, vmax=m, cmap="RdYlBu_r")
     # ax[1, 1].set_title('dI / dvturb')
     # fig.colorbar(mappable, ax=ax[1, 1])
-
-

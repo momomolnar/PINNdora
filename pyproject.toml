@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adora-rt"
+version = "0.1.0"
+description = "Differentiable LTE radiative transfer and response functions with JAX"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "astropy==8.0.1",
+    "interpax==0.3.10",
+    "jax==0.7.1",
+    "jax-dataclasses==1.6.3",
+    "jaxopt==0.8.5",
+    "lightweaver==0.16.1",
+    "matplotlib==3.11.1",
+    "numpy==2.3.5",
+    "optax==0.2.5",
+    "scipy==1.18.1",
+    "tqdm==4.70.0",
+]
+
+[project.scripts]
+adora-pinn-3d = "pinn_3d_inversion:main"
+adora-compare-pinn-precision = "compare_pinn_precision:main"
+adora-plot-pinn-3d = "visualize_pinn_3d_inversion:main"
+
+[project.optional-dependencies]
+test = [
+    "pytest==9.1.1",
+    "ruff==0.12.12",
+]
+
+[tool.setuptools]
+packages = ["adora_data"]
+py-modules = [
+    "PINN_example",
+    "PINN_machinery",
+    "adora_precision",
+    "atmosphere",
+    "compare_pinn_precision",
+    "contop",
+    "create_2D_testset",
+    "iterate",
+    "iterate_adam",
+    "iterate_scipy",
+    "lineop",
+    "lte_pops",
+    "nodes",
+    "pinn_3d_inversion",
+    "pretrain_model",
+    "response_fn",
+    "scalar_formal_solver",
+    "vector_formal_solver",
+    "vector_response_fn",
+    "visualize_pinn_3d_inversion",
+    "voigt",
+]
+
+[tool.setuptools.package-data]
+adora_data = ["*.linelist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff.lint]
+# JAX precision configuration deliberately precedes modules that create
+# numerical arrays; scientific notation also conventionally uses I and l.
+ignore = ["E402", "E741"]

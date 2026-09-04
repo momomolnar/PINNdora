@@ -1,13 +1,16 @@
+import adora_precision
+adora_precision.configure_precision()
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from lineop import AtomicData, read_kurucz
+from adora_data import FE_I_6301_6302_LINE_LIST
+from atmosphere import atmosphere_from_falc
+from lineop import read_kurucz
 from response_fn import lte_rt
 import optax
 import time
 
 def pack_params(temperature, ne, nhtot, vz, vturb):
-    return np.stack([
+    return jnp.stack([
         temperature,
         ne,
         nhtot,
@@ -16,6 +19,9 @@ def pack_params(temperature, ne, nhtot, vz, vturb):
     ]).reshape(-1)
 
 def params_to_tuple(params):
+    params = jnp.asarray(params)
+    if params.ndim != 1 or params.shape[0] % 5 != 0:
+        raise ValueError("params must be a one-dimensional array with length divisible by 5")
     p = params.reshape(5, -1)
     return (
         p[0],
@@ -24,6 +30,52 @@ def params_to_tuple(params):
         p[3],
         p[4],
     )
+
+
+def physical_to_unconstrained(params):
+    temperature, ne, nhtot, vz, vturb = params_to_tuple(params)
+    eps = jnp.asarray(1e-6, dtype=jnp.result_type(params, jnp.float32))
+
+    def logit(fraction):
+        fraction = jnp.clip(fraction, eps, 1.0 - eps)
+        return jnp.log(fraction) - jnp.log1p(-fraction)
+
+    def bounded(value, lower, upper):
+        return logit((value - lower) / (upper - lower))
+
+    def log_bounded(value, lower, upper):
+        safe_value = jnp.clip(value, lower, upper)
+        fraction = (jnp.log(safe_value) - jnp.log(lower)) / (
+            jnp.log(upper) - jnp.log(lower)
+        )
+        return logit(fraction)
+
+    return pack_params(
+        bounded(temperature, 2.5e3, 100e3),
+        log_bounded(ne, 1e16, 1e22),
+        log_bounded(nhtot, 1e16, 1e24),
+        bounded(vz, -20e3, 20e3),
+        bounded(vturb, 0.0, 20e3),
+    )
+
+
+def unconstrained_to_physical(params):
+    temperature, ne, nhtot, vz, vturb = params_to_tuple(params)
+
+    def bounded(value, lower, upper):
+        return lower + (upper - lower) * jax.nn.sigmoid(value)
+
+    def log_bounded(value, lower, upper):
+        return jnp.exp(bounded(value, jnp.log(lower), jnp.log(upper)))
+
+    return pack_params(
+        bounded(temperature, 2.5e3, 100e3),
+        log_bounded(ne, 1e16, 1e22),
+        log_bounded(nhtot, 1e16, 1e24),
+        bounded(vz, -20e3, 20e3),
+        bounded(vturb, 0.0, 20e3),
+    )
+
 
 lte_rt_jit = jax.jit(
         lte_rt,
@@ -85,29 +137,21 @@ lte_rt_wave = jax.vmap(
 if __name__ == "__main__":
     import lightweaver as lw
     from lightweaver.fal import Falc82
-    import numpy as np
     import matplotlib.pyplot as plt
     try:
-        get_ipython().run_line_magic("matplotlib", "")
-    except:
+        from IPython import get_ipython
+        ipython = get_ipython()
+    except ImportError:
+        ipython = None
+    if ipython is None:
         plt.ion()
+    else:
+        ipython.run_line_magic("matplotlib", "")
 
-    lines = read_kurucz("kurucz_6301_6302.linelist")
+    lines = read_kurucz(FE_I_6301_6302_LINE_LIST)
 
     fal = Falc82()
-    dz = jnp.array(
-        np.concatenate(
-            [
-                [fal.z[::-1][0] - fal.z[::-1][1]],
-                fal.z[::-1][1:] - fal.z[::-1][:-1]
-            ]
-        )
-    )
-    temperature = jnp.array(fal.temperature[::-1])
-    ne = jnp.array(fal.ne[::-1])
-    nhtot = jnp.array(fal.nHTot[::-1])
-    vturb = jnp.array(fal.vturb[::-1])
-    vz = jnp.zeros(temperature.shape[0])
+    _, dz, temperature, ne, nhtot, vz, vturb = atmosphere_from_falc(fal)
 
     temperature_target = temperature.copy()
     temperature_target = temperature_target + jnp.sin(jnp.linspace(0.0, 6.0 * jnp.pi, temperature.shape[0])) * 400
@@ -140,7 +184,7 @@ if __name__ == "__main__":
 
     @jax.jit
     def loss(params, target):
-        params = params.reshape(5, -1)
+        params = unconstrained_to_physical(params).reshape(5, -1)
         temperature = params[0]
         ne = params[1]
         nhtot = params[2]
@@ -169,7 +213,7 @@ if __name__ == "__main__":
             accumulation_size=3,
         )
     )
-    params = initial_params.copy()
+    params = physical_to_unconstrained(initial_params)
     opt_state = tx.init(params)
 
     start = time.time()
@@ -181,15 +225,16 @@ if __name__ == "__main__":
 
         updates, opt_state = tx.update(grads, opt_state, value=loss_val)
         params = optax.apply_updates(params, updates)
+    jax.block_until_ready(loss_history[-1])
     stop = time.time()
 
     print(f"{num_steps} iterations in {stop - start:.2f} s")
 
-    plt.plot(waves, lte_rt_wave(lines, waves, dz, *params_to_tuple(params)), '--')
+    physical_params = unconstrained_to_physical(params)
+    plt.plot(waves, lte_rt_wave(lines, waves, dz, *params_to_tuple(physical_params)), '--')
 
     plt.figure()
     plt.plot(loss_history)
     plt.xlabel("Epoch")
-    plt.xlabel("MSE")
+    plt.ylabel("MSE")
     plt.yscale("log")
-

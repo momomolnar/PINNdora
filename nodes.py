@@ -1,9 +1,13 @@
+import adora_precision
+adora_precision.configure_precision()
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import numpy as np
 from interpax import interp1d
 import jax_dataclasses as jdc
-from lineop import AtomicData, read_kurucz, emis_opac_polarised, planck
+from adora_data import FE_I_6301_6302_LINE_LIST
+from atmosphere import atmosphere_from_falc
+from lineop import read_kurucz
 from vector_response_fn import lte_polarised_rt
 import lightweaver as lw
 from scipy.optimize import least_squares
@@ -22,20 +26,55 @@ class NodeSpec:
     n_chi_b: jdc.Static[int]
     n_interp: jdc.Static[int]
 
+    def __post_init__(self):
+        if not np.isfinite(self.z_min) or not np.isfinite(self.z_max):
+            raise ValueError("z_min and z_max must be finite")
+        if self.z_max <= self.z_min:
+            raise ValueError("z_max must be greater than z_min")
+
+        for name, count in self._parameter_counts:
+            if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)):
+                raise TypeError(f"{name} must be an integer")
+            if count < 1:
+                raise ValueError(f"{name} must be at least 1")
+        if isinstance(self.n_interp, (bool, np.bool_)) or not isinstance(
+            self.n_interp, (int, np.integer)
+        ):
+            raise TypeError("n_interp must be an integer")
+        if self.n_interp < 2:
+            raise ValueError("n_interp must be at least 2")
+
     @property
-    def n_nodes(self):
+    def _parameter_counts(self):
         return (
-            self.n_temperature +
-            self.n_ne +
-            self.n_nhtot +
-            self.n_vz +
-            self.n_vturb +
-            self.n_b +
-            self.n_gamma_b +
-            self.n_chi_b
+            ("n_temperature", self.n_temperature),
+            ("n_ne", self.n_ne),
+            ("n_nhtot", self.n_nhtot),
+            ("n_vz", self.n_vz),
+            ("n_vturb", self.n_vturb),
+            ("n_b", self.n_b),
+            ("n_gamma_b", self.n_gamma_b),
+            ("n_chi_b", self.n_chi_b),
         )
 
+    @property
+    def n_nodes(self):
+        return sum(count for _, count in self._parameter_counts)
+
+    def _validate_parameter_arrays(self, parameters):
+        validated = []
+        for (name, count), parameter in zip(self._parameter_counts, parameters):
+            parameter = jnp.asarray(parameter)
+            if parameter.ndim != 1 or parameter.shape[0] != count:
+                raise ValueError(f"{name[2:]} must have shape ({count},)")
+            validated.append(parameter)
+        return tuple(validated)
+
     def unpack_nodes(self, nodes):
+        nodes = jnp.asarray(nodes)
+        if nodes.ndim != 1 or nodes.shape[0] != self.n_nodes:
+            raise ValueError(f"nodes must have shape ({self.n_nodes},)")
+
         running = 0
         temperature = nodes[running:running+self.n_temperature]
         running = running + self.n_temperature
@@ -76,14 +115,47 @@ class NodeSpec:
             gamma_b,
             chi_b,
         ):
+        parameters = self._validate_parameter_arrays(
+            (temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b)
+        )
+        dtype = jnp.result_type(*parameters, jnp.float32)
+        if jnp.issubdtype(dtype, jnp.complexfloating):
+            raise TypeError("atmospheric node values must be real")
+        parameters = tuple(parameter.astype(dtype) for parameter in parameters)
+        temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b = parameters
+
+        # Give direct/eager callers an actionable error. Log-interpolated
+        # densities also retain a finite fallback during traced execution.
+        for name, parameter, domain in (
+            ("temperature", temperature, "positive"),
+            ("ne", ne, "positive"),
+            ("nhtot", nhtot, "positive"),
+            ("vz", vz, None),
+            ("vturb", vturb, "non-negative"),
+            ("b", b, "non-negative"),
+            ("gamma_b", gamma_b, None),
+            ("chi_b", chi_b, None),
+        ):
+            if not isinstance(parameter, jax.core.Tracer):
+                values = np.asarray(parameter)
+                if not np.all(np.isfinite(values)):
+                    raise ValueError(f"{name} nodes must be finite")
+                if domain == "positive" and np.any(values <= 0.0):
+                    raise ValueError(f"{name} nodes must be strictly positive")
+                if domain == "non-negative" and np.any(values < 0.0):
+                    raise ValueError(f"{name} nodes must be non-negative")
 
         grid = jnp.linspace(self.z_min, self.z_max, self.n_interp)
+
         def reconstruct_param(p, in_log=False):
             if p.shape[0] == 1:
-                return jnp.ones(self.n_interp) * p[0]
+                value = p[0]
+                if in_log:
+                    value = jnp.maximum(value, jnp.finfo(p.dtype).tiny)
+                return jnp.ones(self.n_interp) * value
             else:
                 if in_log:
-                    p = jnp.log10(p)
+                    p = jnp.log10(jnp.maximum(p, jnp.finfo(p.dtype).tiny))
                 result = interp1d(grid, jnp.linspace(self.z_min, self.z_max, p.shape[0]), p)
                 if in_log:
                     result = 10**result
@@ -113,10 +185,65 @@ class NodeSpec:
         return self.reconstruct_atmos(*self.unpack_nodes(nodes))
 
     def interp_to_nodes(self, z, temperature, ne, nhtot, vz, vturb, b=None, gamma_b=None, chi_b=None):
+        z_values = np.asarray(z)
+        if z_values.ndim != 1 or z_values.size < 2:
+            raise ValueError("z must be a one-dimensional array with at least two points")
+        if not np.all(np.isfinite(z_values)):
+            raise ValueError("z must contain only finite values")
+        if np.any(np.diff(z_values) <= 0.0):
+            raise ValueError("z must be strictly increasing")
+        if z_values[0] > self.z_min or z_values[-1] < self.z_max:
+            raise ValueError("z must cover the complete [z_min, z_max] interval")
+
+        parameter_values = {
+            "temperature": temperature,
+            "ne": ne,
+            "nhtot": nhtot,
+            "vz": vz,
+            "vturb": vturb,
+            "b": b,
+            "gamma_b": gamma_b,
+            "chi_b": chi_b,
+        }
+        for name, parameter in parameter_values.items():
+            if parameter is None:
+                continue
+            values = np.asarray(parameter)
+            if values.ndim != 1 or values.shape != z_values.shape:
+                raise ValueError(f"{name} must be one-dimensional and have the same shape as z")
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{name} must contain only finite values")
+        if np.any(np.asarray(temperature) <= 0.0):
+            raise ValueError("temperature must be strictly positive")
+        if np.any(np.asarray(ne) <= 0.0):
+            raise ValueError("ne must be strictly positive")
+        if np.any(np.asarray(nhtot) <= 0.0):
+            raise ValueError("nhtot must be strictly positive")
+        if np.any(np.asarray(vturb) < 0.0):
+            raise ValueError("vturb must be non-negative")
+        if b is not None and np.any(np.asarray(b) < 0.0):
+            raise ValueError("b must be non-negative")
+
+        z = jnp.asarray(z)
+        temperature = jnp.asarray(temperature)
+        ne = jnp.asarray(ne)
+        nhtot = jnp.asarray(nhtot)
+        vz = jnp.asarray(vz)
+        vturb = jnp.asarray(vturb)
+        b = None if b is None else jnp.asarray(b)
+        gamma_b = None if gamma_b is None else jnp.asarray(gamma_b)
+        chi_b = None if chi_b is None else jnp.asarray(chi_b)
         z_mask = (z >= self.z_min) & (z <= self.z_max)
+        has_sample_in_interval = bool(
+            np.any((z_values >= self.z_min) & (z_values <= self.z_max))
+        )
+
         def interp_to_nodes(p, n_nodes):
             if n_nodes == 1:
-                return jnp.array([jnp.mean(p[z_mask])])
+                if has_sample_in_interval:
+                    return jnp.array([jnp.mean(p[z_mask])])
+                midpoint = 0.5 * (self.z_min + self.z_max)
+                return jnp.array([jnp.interp(midpoint, z, p)])
             else:
                 grid = jnp.linspace(self.z_min, self.z_max, n_nodes)
                 return jnp.interp(grid, z, p)
@@ -151,16 +278,10 @@ class NodeSpec:
         )
 
     def pack_nodes(self, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b):
-        return jnp.concatenate([
-            temperature,
-            ne,
-            nhtot,
-            vz,
-            vturb,
-            b,
-            gamma_b,
-            chi_b
-        ])
+        parameters = self._validate_parameter_arrays(
+            (temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b)
+        )
+        return jnp.concatenate(parameters)
 
     def interpolate_and_pack_nodes(self, z, temperature, ne, nhtot, vz, vturb, b=None, gamma_b=None, chi_b=None):
         return self.pack_nodes(*self.interp_to_nodes(z, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b))
@@ -192,12 +313,16 @@ compute_residual_jac_vmap = jax.jit(
 
 if __name__ == "__main__":
     from lightweaver.fal import Falc82
-    import numpy as np
     import matplotlib.pyplot as plt
     try:
-        get_ipython().run_line_magic("matplotlib", "")
-    except:
+        from IPython import get_ipython
+        ipython = get_ipython()
+    except ImportError:
+        ipython = None
+    if ipython is None:
         plt.ion()
+    else:
+        ipython.run_line_magic("matplotlib", "")
 
     fal = Falc82()
 
@@ -218,31 +343,28 @@ if __name__ == "__main__":
         n_interp=30
     )
 
-    node_sets = nodes.interp_to_nodes(
-        fal.z[::-1],
-        fal.temperature[::-1],
-        fal.ne[::-1],
-        fal.nHTot[::-1],
-        fal.vz[::-1],
-        fal.vturb[::-1],
-    )
-
-    dz = jnp.array(
-        np.concatenate(
-            [
-                [fal.z[::-1][0] - fal.z[::-1][1]],
-                fal.z[::-1][1:] - fal.z[::-1][:-1]
-            ]
-        )
-    )
-    temperature = jnp.array(fal.temperature[::-1])
-    ne = jnp.array(fal.ne[::-1])
-    nhtot = jnp.array(fal.nHTot[::-1])
-    vturb = jnp.array(fal.vturb[::-1])
+    z, dz, temperature, ne, nhtot, vz, vturb = atmosphere_from_falc(fal)
     vz = jnp.linspace(1.0, 0.0, temperature.shape[0]) * 8e3
     b = jnp.ones(temperature.shape[0]) * 0.02
     gamma_b = jnp.ones(temperature.shape[0]) * 0.7
     chi_b = jnp.zeros(temperature.shape[0])
+
+    # Start away from the exactly zero-field/axis-aligned singularity, where
+    # inclination and azimuth response columns vanish identically.
+    initial_b = jnp.ones_like(b) * 0.005
+    initial_gamma_b = jnp.ones_like(gamma_b) * 0.5
+    initial_chi_b = jnp.ones_like(chi_b) * 0.1
+    node_sets = nodes.interp_to_nodes(
+        z,
+        temperature,
+        ne,
+        nhtot,
+        jnp.zeros_like(vz),
+        vturb,
+        initial_b,
+        initial_gamma_b,
+        initial_chi_b,
+    )
 
     waves = jnp.linspace(lw.air_to_vac(630.1), lw.air_to_vac(630.3), 201)
 
@@ -253,7 +375,7 @@ if __name__ == "__main__":
             out_axes=1,
         )
     )
-    lines = read_kurucz("kurucz_6301_6302.linelist")
+    lines = read_kurucz(FE_I_6301_6302_LINE_LIST)
     intens_ref = lte_rt_wave(lines, waves, dz, temperature, ne, nhtot, vz, vturb, b, gamma_b, chi_b)
 
     starting_nodes = nodes.pack_nodes(*node_sets)
