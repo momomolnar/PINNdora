@@ -6,14 +6,16 @@ the forward solver and is therefore safe to run on a headless login node.
 
 By default four figures are written:
 
-* input/truth thermodynamics: temperature, electron density, LOS velocity;
+* input/truth thermodynamics: temperature, electron density, total hydrogen
+  density, and LOS velocity;
 * inferred thermodynamics;
 * input/truth Cartesian magnetic components; and
 * inferred Cartesian magnetic components.
 
-Every figure has three height rows and three physical-component columns. The
-input and inferred figures share identical color normalization so they can be
-compared directly.
+Every figure has three height rows and one column per physical component: four
+columns for thermodynamics and three for the magnetic field. The input and
+inferred figures share identical color normalization so they can be compared
+directly.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ DEFAULT_HEIGHT_FRACTIONS = (0.2, 0.5, 0.8)
 _ARCHIVE_FIELD_KEYS = {
     "temperature": "temperature_K",
     "ne": "electron_density_m3",
+    "nhtot": "hydrogen_density_m3",
     "vz": "los_velocity_m_s",
     "b": "magnetic_field_T",
     "gamma": "inclination_rad",
@@ -73,6 +76,12 @@ THERMODYNAMIC_SPECS = (
     ComponentSpec(
         "log_ne",
         r"Electron density $\log_{10}(n_e\,[\mathrm{m}^{-3}])$",
+        "viridis",
+        False,
+    ),
+    ComponentSpec(
+        "log_nhtot",
+        r"Total hydrogen density $\log_{10}(n_{\mathrm{H,tot}}\,[\mathrm{m}^{-3}])$",
         "viridis",
         False,
     ),
@@ -141,6 +150,10 @@ def load_inversion_slices(path: str | Path = DEFAULT_RESULT) -> InversionSlices:
             raise ValueError(f"{state} temperature must be strictly positive")
         if np.any(fields["ne"] <= 0.0):
             raise ValueError(f"{state} electron density must be strictly positive")
+        if np.any(fields["nhtot"] <= 0.0):
+            raise ValueError(
+                f"{state} total hydrogen density must be strictly positive"
+            )
         if np.any(fields["b"] < 0.0):
             raise ValueError(f"{state} magnetic-field strength cannot be negative")
         if np.any((fields["gamma"] < 0.0) | (fields["gamma"] > np.pi)):
@@ -216,6 +229,7 @@ def thermodynamic_components(fields: dict[str, np.ndarray]) -> dict[str, np.ndar
     return {
         "temperature": np.asarray(fields["temperature"]),
         "log_ne": np.log10(np.asarray(fields["ne"])),
+        "log_nhtot": np.log10(np.asarray(fields["nhtot"])),
         "vz": 1.0e-3 * np.asarray(fields["vz"]),
     }
 
@@ -286,17 +300,21 @@ def plot_component_grid(
     *,
     title: str,
 ):
-    """Create one three-height by three-component horizontal-slice figure."""
+    """Create one three-height horizontal-slice figure for the components."""
 
     indices = np.asarray(indices, dtype=int)
     if indices.shape != (3,):
         raise ValueError("a component grid requires exactly three height indices")
+    if not specs:
+        raise ValueError("a component grid requires at least one component")
+    n_columns = len(specs)
     figure, axes = plt.subplots(
         3,
-        3,
-        figsize=(13.5, 11.0),
+        n_columns,
+        figsize=(4.5 * n_columns, 11.0),
         sharex=True,
         sharey=True,
+        squeeze=False,
         constrained_layout=True,
     )
     extent = (*_horizontal_extent(data.x), *_horizontal_extent(data.y))
@@ -426,7 +444,7 @@ def generate_visualizations(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot 3x3 horizontal slices of a PINN inversion's input and output "
+            "Plot horizontal slices of a PINN inversion's input and output "
             "atmospheres."
         )
     )

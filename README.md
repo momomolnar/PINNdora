@@ -237,8 +237,9 @@ reach `1e-4` before spectral fitting proceeds.
 `visualize_pinn_3d_inversion.py` reads the self-contained result archive and
 writes four headless figures: input and inferred thermodynamics, followed by
 input and inferred Cartesian magnetic components. Every figure has three
-height rows and three component columns and covers the complete normalized
-horizontal domain. Input/output figures use the same component color limits.
+height rows and covers the complete normalized horizontal domain. The
+thermodynamic figures have four columns; the magnetic figures have three.
+Input/output figures use the same component color limits.
 
 ```bash
 python visualize_pinn_3d_inversion.py \
@@ -257,8 +258,9 @@ python visualize_pinn_3d_inversion.py --heights-km 250 500 1000
 python visualize_pinn_3d_inversion.py --height-indices 18 24 35 --format pdf
 ```
 
-Temperature is shown in kelvin, electron density as `log10(m^-3)`, and LOS
-velocity in `km/s`. The magnetic panels convert the archived strength,
+Temperature is shown in kelvin, electron and total hydrogen densities as
+`log10(m^-3)`, and LOS velocity in `km/s`. The magnetic panels convert the
+archived strength,
 inclination, and azimuth into `Bx = B sin(gamma) cos(chi)`,
 `By = B sin(gamma) sin(chi)`, and LOS `Bz = B cos(gamma)`, displayed in gauss.
 Use `--state` or `--quantity` to render only a subset.

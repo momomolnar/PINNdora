@@ -23,7 +23,12 @@ def visualization_archive(tmp_path):
     )
     truth = {
         "temperature_K": 5000.0 + 1800.0 * zz + 300.0 * perturbation,
-        "electron_density_m3": 1.0e20 * np.exp(-3.0 * zz) * np.exp(0.1 * perturbation),
+        "electron_density_m3": 1.0e20
+        * np.exp(-3.2 * zz)
+        * np.exp(-0.08 * perturbation),
+        "hydrogen_density_m3": 1.0e23
+        * np.exp(-3.0 * zz)
+        * np.exp(0.1 * perturbation),
         "los_velocity_m_s": 1800.0 * perturbation,
         "magnetic_field_T": 0.05 * np.exp(0.08 * perturbation),
         "inclination_rad": 0.8 + 0.12 * perturbation,
@@ -32,6 +37,8 @@ def visualization_archive(tmp_path):
     inferred = {
         "temperature_K": truth["temperature_K"] * (1.0 + 0.01 * perturbation),
         "electron_density_m3": truth["electron_density_m3"]
+        * np.exp(0.03 * perturbation),
+        "hydrogen_density_m3": truth["hydrogen_density_m3"]
         * np.exp(-0.02 * perturbation),
         "los_velocity_m_s": 0.92 * truth["los_velocity_m_s"] + 40.0,
         "magnetic_field_T": truth["magnetic_field_T"] * np.exp(0.01 * perturbation),
@@ -53,9 +60,22 @@ def visualization_archive(tmp_path):
 def test_load_inversion_slices_validates_shapes_and_physics(visualization_archive):
     data = viz.load_inversion_slices(visualization_archive)
     assert data.shape == (4, 5, 7)
-    assert set(data.truth) == {"temperature", "ne", "vz", "b", "gamma", "chi"}
+    assert set(data.truth) == {
+        "temperature",
+        "ne",
+        "nhtot",
+        "vz",
+        "b",
+        "gamma",
+        "chi",
+    }
     assert set(data.inferred) == set(data.truth)
     assert np.all(data.truth["temperature"] > 0.0)
+    assert np.all(data.truth["ne"] > 0.0)
+    assert np.all(data.truth["nhtot"] > 0.0)
+    components = viz.thermodynamic_components(data.truth)
+    np.testing.assert_allclose(components["log_ne"], np.log10(data.truth["ne"]))
+    np.testing.assert_allclose(components["log_nhtot"], np.log10(data.truth["nhtot"]))
 
 
 def test_height_selection_supports_indices_km_and_fractions(visualization_archive):
@@ -105,9 +125,11 @@ def test_component_grid_has_three_rows_columns_and_shared_colorbars(
         title="Test atmosphere",
     )
     try:
-        assert len(figure.axes) == 12
-        assert all(len(axis.images) == 1 for axis in figure.axes[:9])
-        assert [axis.get_title() for axis in figure.axes[:3]] == [
+        n_columns = len(viz.THERMODYNAMIC_SPECS)
+        n_panels = len(indices) * n_columns
+        assert len(figure.axes) == n_panels + n_columns
+        assert all(len(axis.images) == 1 for axis in figure.axes[:n_panels])
+        assert [axis.get_title() for axis in figure.axes[:n_columns]] == [
             spec.title for spec in viz.THERMODYNAMIC_SPECS
         ]
     finally:
