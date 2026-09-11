@@ -107,6 +107,20 @@ def _optional_positive_float(value: str) -> float | None:
     return parsed
 
 
+def _spatial_scale(value: str) -> tuple[float, ...]:
+    try:
+        scales = tuple(float(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "spatial scale must be eight positive finite values"
+        ) from exc
+    if len(scales) != 8 or any(not math.isfinite(item) or item <= 0 for item in scales):
+        raise argparse.ArgumentTypeError(
+            "spatial scale must be eight positive finite values"
+        )
+    return scales
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the public precision-comparison command-line interface."""
 
@@ -132,21 +146,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "FP64 checkpoint is created before both measured runs"
         ),
     )
-    parser.add_argument("--base-hidden", type=_hidden_layers, default=(128, 128, 128))
     parser.add_argument("--spatial-hidden", type=_hidden_layers, default=(96, 96, 96))
-    parser.add_argument("--base-frequencies", type=_nonnegative_integer, default=6)
-    parser.add_argument("--pretrain-steps", type=_nonnegative_integer, default=2000)
-    parser.add_argument("--pretrain-learning-rate", type=float, default=2.0e-3)
-    parser.add_argument(
-        "--pretrain-tolerance",
-        type=_optional_positive_float,
-        default=None,
-        metavar="FLOAT|none",
-        help="optional latent-MSE requirement; disabled by default for comparison",
-    )
-    parser.add_argument("--skip-pretraining", action="store_true")
+    parser.add_argument("--spatial-scale", type=_spatial_scale, default=(1.0,) * 8)
     parser.add_argument("--inversion-epochs", type=_nonnegative_integer, default=10)
-    parser.add_argument("--inversion-learning-rate", type=float, default=3.0e-4)
+    parser.add_argument("--inversion-learning-rate", type=float, default=1.0e-3)
+    parser.add_argument("--inversion-final-learning-rate", type=float, default=1.0e-5)
     parser.add_argument("--training-batch-columns", type=_positive_integer, default=8)
     parser.add_argument("--validation-columns", type=_positive_integer, default=8)
     parser.add_argument("--wavelength-batch", type=_positive_integer, default=48)
@@ -159,7 +163,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         metavar="I,Q,U,V",
     )
     parser.add_argument("--prior-weight", type=float, default=1.0e-5)
-    parser.add_argument("--fine-tune-base", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timing-repeats", type=_positive_integer, default=3)
     parser.add_argument(
@@ -212,7 +215,9 @@ def _json_ready(value: Any) -> Any:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(_json_ready(payload), indent=2, sort_keys=True, allow_nan=False)
+    encoded = json.dumps(
+        _json_ready(payload), indent=2, sort_keys=True, allow_nan=False
+    )
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(encoded + "\n", encoding="utf-8")
     temporary.replace(path)
@@ -287,9 +292,7 @@ def _invoke_worker(
         # JAX reports the backend as ``gpu`` but registers CUDA under the
         # ``cuda`` platform name used by JAX_PLATFORMS.
         environment["JAX_PLATFORMS"] = "cuda" if platform == "gpu" else platform
-    command = _worker_command(
-        mode, precision, config_path, output_path, summary_path
-    )
+    command = _worker_command(mode, precision, config_path, output_path, summary_path)
     completed = subprocess.run(
         command,
         env=environment,
@@ -337,16 +340,16 @@ def array_comparison(reference: np.ndarray, candidate: np.ndarray) -> dict[str, 
             float(np.mean(np.abs(difference))) if difference.size else 0.0
         ),
         "rmse": (
-            float(np.sqrt(np.mean(np.square(difference))))
-            if difference.size
-            else 0.0
+            float(np.sqrt(np.mean(np.square(difference)))) if difference.size else 0.0
         ),
         "relative_l2": _finite_ratio(difference_l2, reference_l2),
         "normalized_max": _finite_ratio(max_absolute, reference_max),
     }
 
 
-def _gradient_comparison(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]:
+def _gradient_comparison(
+    reference: np.ndarray, candidate: np.ndarray
+) -> dict[str, Any]:
     result = array_comparison(reference, candidate)
     reference64 = np.asarray(reference, dtype=np.float64).ravel()
     candidate64 = np.asarray(candidate, dtype=np.float64).ravel()
@@ -442,7 +445,9 @@ def build_comparison_report(
 ) -> dict[str, Any]:
     """Combine worker artifacts and validate the reproducibility contract."""
 
-    summaries = {precision: _read_json(summary_paths[precision]) for precision in PRECISIONS}
+    summaries = {
+        precision: _read_json(summary_paths[precision]) for precision in PRECISIONS
+    }
     archives: dict[str, dict[str, np.ndarray]] = {}
     for precision in PRECISIONS:
         with np.load(artifact_paths[precision], allow_pickle=False) as archive:
@@ -455,7 +460,9 @@ def build_comparison_report(
         for precision in PRECISIONS
     }
     if len(set(schedule_hashes.values())) != 1 or None in schedule_hashes.values():
-        raise ValueError(f"precision workers used different schedules: {schedule_hashes}")
+        raise ValueError(
+            f"precision workers used different schedules: {schedule_hashes}"
+        )
     for name in (
         "diagnostic_column_indices",
         "diagnostic_wavelength_indices",
@@ -467,13 +474,6 @@ def build_comparison_report(
     fp64 = archives["fp64"]
     fp32 = archives["fp32"]
     convergence = {
-        "pretraining": {
-            "fp64": fp64["pretrain_loss"].tolist(),
-            "fp32": fp32["pretrain_loss"].tolist(),
-            "difference": array_comparison(
-                fp64["pretrain_loss"], fp32["pretrain_loss"]
-            ),
-        },
         "inversion": {
             "columns": ["total", "spectral", "prior"],
             "fp64": fp64["inversion_loss"].tolist(),
@@ -529,9 +529,7 @@ def build_comparison_report(
             ),
             "relative_l2": "L2(FP32 - FP64) / L2(FP64)",
             "normalized_max": "max_abs(FP32 - FP64) / max_abs(FP64)",
-            "gradient_cosine_similarity": (
-                "dot(FP64, FP32) / (L2(FP64) * L2(FP32))"
-            ),
+            "gradient_cosine_similarity": ("dot(FP64, FP32) / (L2(FP64) * L2(FP32))"),
         },
         "speedup_fp64_over_fp32": _timing_speedups(
             summaries["fp64"]["timings_seconds"],
@@ -567,8 +565,8 @@ def build_comparison_report(
 
 def _public_config(args: argparse.Namespace) -> dict[str, Any]:
     numeric_positive = (
-        "pretrain_learning_rate",
         "inversion_learning_rate",
+        "inversion_final_learning_rate",
     )
     for name in numeric_positive:
         value = float(getattr(args, name))
@@ -576,6 +574,10 @@ def _public_config(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(f"--{name.replace('_', '-')} must be positive and finite")
     if not math.isfinite(args.prior_weight) or args.prior_weight < 0:
         raise ValueError("--prior-weight must be non-negative and finite")
+    if args.inversion_final_learning_rate > args.inversion_learning_rate:
+        raise ValueError(
+            "--inversion-final-learning-rate must not exceed --inversion-learning-rate"
+        )
     if args.platform == "cpu" and not args.allow_cpu:
         raise ValueError("--platform cpu requires the explicit --allow-cpu flag")
     dataset = args.dataset.resolve()
@@ -591,15 +593,11 @@ def _public_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "dataset": str(dataset),
         "kurucz": str(kurucz),
-        "base_hidden": list(args.base_hidden),
         "spatial_hidden": list(args.spatial_hidden),
-        "base_frequencies": args.base_frequencies,
-        "pretrain_steps": args.pretrain_steps,
-        "pretrain_learning_rate": args.pretrain_learning_rate,
-        "pretrain_tolerance": args.pretrain_tolerance,
-        "skip_pretraining": args.skip_pretraining,
+        "spatial_scale": list(args.spatial_scale),
         "inversion_epochs": args.inversion_epochs,
         "inversion_learning_rate": args.inversion_learning_rate,
+        "inversion_final_learning_rate": args.inversion_final_learning_rate,
         "training_batch_columns": args.training_batch_columns,
         "validation_columns": args.validation_columns,
         "wavelength_batch": args.wavelength_batch,
@@ -607,7 +605,6 @@ def _public_config(args: argparse.Namespace) -> dict[str, Any]:
         "synthesis_batch_columns": args.synthesis_batch_columns,
         "stokes_weights": list(args.stokes_weights),
         "prior_weight": args.prior_weight,
-        "fine_tune_base": args.fine_tune_base,
         "seed": args.seed,
         "timing_repeats": args.timing_repeats,
         "platform": args.platform,
@@ -698,7 +695,9 @@ def _synchronize(jax_module: Any, value: Any) -> Any:
     return value
 
 
-def _benchmark(jax_module: Any, function: Any, repeats: int) -> tuple[Any, dict[str, Any]]:
+def _benchmark(
+    jax_module: Any, function: Any, repeats: int
+) -> tuple[Any, dict[str, Any]]:
     import time
 
     started = time.perf_counter()
@@ -761,7 +760,10 @@ def _verify_worker_environment(
             "be configured before importing JAX"
         )
     expected_platform = config["platform"]
-    if expected_platform != "auto" and jax_module.default_backend() != expected_platform:
+    if (
+        expected_platform != "auto"
+        and jax_module.default_backend() != expected_platform
+    ):
         raise RuntimeError(
             f"requested JAX platform {expected_platform!r}, got "
             f"{jax_module.default_backend()!r}"
@@ -776,7 +778,9 @@ def _verify_worker_environment(
         required in str(device.device_kind).lower()
         for device in jax_module.local_devices()
     ):
-        kinds = ", ".join(str(device.device_kind) for device in jax_module.local_devices())
+        kinds = ", ".join(
+            str(device.device_kind) for device in jax_module.local_devices()
+        )
         raise RuntimeError(
             f"no selected JAX device contains {required!r}; available: {kinds}"
         )
@@ -789,12 +793,16 @@ def _initialize_worker(config: dict[str, Any], output_path: Path) -> None:
 
     _verify_worker_environment("fp64", config, jax)
     field_config = pinn.NeuralFieldConfig(
-        base_hidden=tuple(config["base_hidden"]),
         spatial_hidden=tuple(config["spatial_hidden"]),
-        base_frequencies=int(config["base_frequencies"]),
+        spatial_scale=tuple(config["spatial_scale"]),
     )
+    payload = pinn.load_test_cube(config["dataset"])
+    reference = pinn._atmosphere_from_payload(payload, "reference_")
     params = pinn.initialize_neural_field(
-        jax.random.PRNGKey(int(config["seed"])), field_config
+        jax.random.PRNGKey(int(config["seed"])),
+        reference,
+        payload["height_normalized"],
+        field_config,
     )
     _synchronize(jax, params)
     pinn.save_checkpoint(output_path, params, field_config)
@@ -868,11 +876,13 @@ def _comparison_worker(
         atol=1.0e-10,
     ):
         raise ValueError("the Kurucz data do not match the comparison dataset")
-    if str(np.asarray(payload["atomic_data_sha256"])) != pinn.atomic_data_fingerprint(lines):
+    if str(np.asarray(payload["atomic_data_sha256"])) != pinn.atomic_data_fingerprint(
+        lines
+    ):
         raise ValueError("the atomic-data fingerprint does not match the dataset")
 
     params, field_config = pinn.load_checkpoint(config["shared_initial_checkpoint"])
-    initial_parameters, _ = ravel_pytree(params)
+    initial_parameters, _ = ravel_pytree(params["spatial"])
     _synchronize(jax, initial_parameters)
     timings: dict[str, float] = {}
     coordinate_cube = pinn._coordinate_cube_from_payload(payload)
@@ -922,48 +932,25 @@ def _comparison_worker(
         }
     )
 
-    if config["fine_tune_base"]:
-        gradient_candidate = params
+    gradient_candidate = params["spatial"]
+    reference = pinn.reference_at_coordinates(params, coordinates[0])
 
-        def diagnostic_loss(candidate):
-            return pinn.neural_spectral_loss_offset(
-                candidate,
-                batch_coordinates,
-                batch_wavelength_offsets,
-                batch_observed,
-                batch_continuum,
-                dz,
-                lines,
-                spatial_scale,
-                stokes_weights,
-                batch_mask,
-                float(config["prior_weight"]),
-                int(config["wavelength_parallelism"]),
-            )[0]
-
-    else:
-        gradient_candidate = params["spatial"]
-        z_coordinates = coordinates[0, :, 2:3]
-        base_latent = pinn.apply_mlp(
-            params["base"], pinn._base_features(params["base"], z_coordinates)
-        )
-
-        def diagnostic_loss(candidate):
-            return pinn.frozen_base_spectral_loss_offset(
-                candidate,
-                base_latent,
-                batch_coordinates,
-                batch_wavelength_offsets,
-                batch_observed,
-                batch_continuum,
-                dz,
-                lines,
-                spatial_scale,
-                stokes_weights,
-                batch_mask,
-                float(config["prior_weight"]),
-                int(config["wavelength_parallelism"]),
-            )[0]
+    def diagnostic_loss(candidate):
+        return pinn.reference_spectral_loss_offset(
+            candidate,
+            reference,
+            batch_coordinates,
+            batch_wavelength_offsets,
+            batch_observed,
+            batch_continuum,
+            dz,
+            lines,
+            spatial_scale,
+            stokes_weights,
+            batch_mask,
+            float(config["prior_weight"]),
+            int(config["wavelength_parallelism"]),
+        )[0]
 
     compiled_gradient = jax.jit(jax.value_and_grad(diagnostic_loss))
     (diagnostic_loss_value, gradient_tree), gradient_timing = _benchmark(
@@ -981,34 +968,9 @@ def _comparison_worker(
         }
     )
 
-    # The numerical probes intentionally precede precision-specific
-    # pretraining.  Both workers therefore differentiate the same checkpoint
-    # values (modulo the requested FP32 cast), rather than two already-diverged
-    # optimization trajectories.
-    if config["skip_pretraining"]:
-        pretrain_history = np.empty(0, dtype=float)
-        timings["pretraining"] = 0.0
-    else:
-        started = time.perf_counter()
-        params, pretrain_history = pinn.pretrain_falc(
-            params,
-            payload["height_normalized"],
-            pinn._atmosphere_from_payload(payload, "reference_"),
-            steps=int(config["pretrain_steps"]),
-            learning_rate=float(config["pretrain_learning_rate"]),
-            tolerance=config["pretrain_tolerance"],
-            show_progress=False,
-        )
-        _synchronize(jax, params)
-        timings["pretraining"] = time.perf_counter() - started
-
-    # Exercise the same top-level production path as a normal inversion.  The
-    # FAL-C pretraining above is supplied as a warm start, so production runs
-    # zero additional pretraining steps while retaining its own validation,
-    # checkpointing, final cube rendering, and result-schema checks.
-    production_result_path = output_path.with_name(
-        f"{precision}_inversion_result.npz"
-    )
+    # Both precisions start from the same spatial weights and fixed reference.
+    # Use the production path for training, checkpoints and final diagnostics.
+    production_result_path = output_path.with_name(f"{precision}_inversion_result.npz")
     production_checkpoint_path = output_path.with_name(
         f"{precision}_final_checkpoint.npz"
     )
@@ -1020,17 +982,14 @@ def _comparison_worker(
         checkpoint_path=production_checkpoint_path,
         field_config=field_config,
         initial_params=params,
-        pretrain_steps=0,
-        pretrain_learning_rate=float(config["pretrain_learning_rate"]),
-        pretrain_tolerance=None,
         inversion_epochs=int(config["inversion_epochs"]),
         inversion_learning_rate=float(config["inversion_learning_rate"]),
+        inversion_final_learning_rate=float(config["inversion_final_learning_rate"]),
         training_batch_columns=int(config["training_batch_columns"]),
         wavelength_batch=int(config["wavelength_batch"]),
         synthesis_batch_columns=int(config["synthesis_batch_columns"]),
         stokes_weights=tuple(config["stokes_weights"]),
         prior_weight=float(config["prior_weight"]),
-        fine_tune_base=bool(config["fine_tune_base"]),
         seed=int(config["seed"]),
         show_progress=False,
         wavelength_parallelism=int(config["wavelength_parallelism"]),
@@ -1041,16 +1000,12 @@ def _comparison_worker(
     recovered = pinn._atmosphere_from_payload(result, "inferred_")
     _synchronize(jax, (final_spectra, recovered))
     timings["production_run_inversion"] = time.perf_counter() - started
-    timings["total"] = timings["pretraining"] + timings["production_run_inversion"]
-    inversion_history = np.asarray(
-        result["inversion_loss_total_spectral_prior"]
-    )
+    timings["total"] = timings["production_run_inversion"]
+    inversion_history = np.asarray(result["inversion_loss_total_spectral_prior"])
     validation_history = np.asarray(result["validation_full_wavelength_loss"])
 
     observed_cube = np.asarray(payload["observed_stokes"])
-    final_continuum = 0.5 * (
-        observed_cube[:, :, 0, 0] + observed_cube[:, :, 0, -1]
-    )
+    final_continuum = 0.5 * (observed_cube[:, :, 0, 0] + observed_cube[:, :, 0, -1])
 
     arrays: dict[str, np.ndarray] = {
         "diagnostic_column_indices": np.asarray(column_indices),
@@ -1061,7 +1016,6 @@ def _comparison_worker(
         "diagnostic_loss": np.asarray(diagnostic_loss_value),
         "diagnostic_gradient": np.asarray(diagnostic_gradient),
         "initial_parameters": np.asarray(initial_parameters),
-        "pretrain_loss": np.asarray(pretrain_history),
         "inversion_loss": np.asarray(inversion_history),
         "validation_loss": np.asarray(validation_history),
         "final_synthetic_stokes": np.asarray(final_spectra),
@@ -1139,9 +1093,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "final_spectra_relative_l2": report["comparisons"]["spectra"][
             "after_inversion"
         ]["relative_l2"],
-        "gradient_relative_l2": report["comparisons"][
-            "gradient_before_inversion"
-        ]["relative_l2"],
+        "gradient_relative_l2": report["comparisons"]["gradient_before_inversion"][
+            "relative_l2"
+        ],
     }
     print(json.dumps(concise, sort_keys=True, allow_nan=False))
     return 0

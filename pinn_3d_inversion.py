@@ -10,9 +10,9 @@ Running this module without mode flags performs the complete workflow:
 1. Broadcast FAL-C over a 50 x 50 horizontal grid, apply a small smooth 3-D
    perturbation, and synthesize full-Stokes observations for every Fe I line
    in the selected Kurucz file.
-2. Pretrain a vertical neural field to reproduce FAL-C thermodynamics plus a
-   weak, non-axis-aligned magnetic seed field at every horizontal location.
-3. Optimize a shared spatial correction field from the spectral residuals.
+2. Initialize a shared spatial network with exactly zero output, reproducing
+   the stored FAL-C reference (including its magnetic seed) without pretraining.
+3. Fit bounded log10 ratios and signed offsets relative to that fixed reference.
 
 The default problem is intentionally substantial.  Use small ``--nx``,
 ``--ny``, and ``--n-wave`` values for a quick smoke test.
@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 # Precision is process-global in JAX and must be selected before importing any
 # physics module that creates constants or lookup tables.  Direct CLI launches
@@ -56,7 +58,9 @@ from vector_formal_solver import delo_constant_fs_nonsingular
 
 
 SCHEMA_VERSION = 1
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
+PARAMETERIZATION = "fixed_reference_log10_ratios_v2"
+SPECTRA_SCHEMA_VERSION = 1
 STOKES_LABELS = ("I", "Q", "U", "V")
 FIELD_NAMES = (
     "temperature",
@@ -68,45 +72,38 @@ FIELD_NAMES = (
     "gamma_b",
     "chi_b",
 )
-LATENT_CHANNEL_NAMES = (
-    "bounded_log_temperature",
-    "bounded_log_ne",
-    "bounded_log_nhtot",
-    "bounded_los_velocity",
-    "bounded_log_vturb",
-    "bounded_log_magnetic_field",
-    "bounded_inclination",
-    "bounded_azimuth",
+CORRECTION_CHANNEL_NAMES = (
+    "log10_temperature_ratio",
+    "log10_ne_ratio",
+    "log10_nhtot_ratio",
+    "los_velocity_offset_over_20_km_s",
+    "log10_vturb_ratio",
+    "log10_magnetic_field_ratio",
+    "inclination_offset_over_pi",
+    "azimuth_offset_over_half_pi",
 )
 
 DEFAULT_DATASET = Path("data") / "pinn_3d_test_cube.npz"
 DEFAULT_RESULT = Path("data") / "pinn_3d_inversion.npz"
 DEFAULT_CHECKPOINT = Path("data") / "pinn_3d_checkpoint.npz"
+DEFAULT_SPECTRA_OUTPUT = Path("data") / "pinn_3d_spectra.npz"
 DEFAULT_WAVELENGTH_PARALLELISM = 48
 DEFAULT_VALIDATION_COLUMNS = 8
+DEFAULT_INVERSION_INITIAL_LEARNING_RATE = 1.0e-3
+DEFAULT_INVERSION_FINAL_LEARNING_RATE = 1.0e-5
+DEFAULT_WANDB_PROJECT = "adora-pinn-3d"
+DEFAULT_WANDB_EVALUATION_EVERY = 50
 
 # Canonical host values are kept separately from their selected-precision JAX
 # forms.  Checkpoint compatibility is therefore independent of whether a run
 # happens in fp32 or fp64.
-_POSITIVE_LOWER_VALUES = (2500.0, 1.0e14, 1.0e14, 50.0)
-_POSITIVE_UPPER_VALUES = (120000.0, 1.0e23, 1.0e25, 30000.0)
-_SPATIAL_SCALE_VALUES = (0.35, 0.35, 0.35, 0.08, 0.35, 0.20, 0.20, 0.20)
+_SPATIAL_SCALE_VALUES = (1.0,) * 8
+_VELOCITY_SCALE = 2.0e4  # m/s per unit signed correction
+_INCLINATION_SCALE = math.pi
+_AZIMUTH_SCALE = 0.5 * math.pi
 
-# The network represents positive quantities through a bounded logarithmic
-# transform.  The bounds cover FAL-C with room for the deliberately small
-# perturbations used here while preventing invalid atmospheric states.
-_POSITIVE_LOWER = jnp.asarray(_POSITIVE_LOWER_VALUES, dtype=REAL_DTYPE)
-_POSITIVE_UPPER = jnp.asarray(_POSITIVE_UPPER_VALUES, dtype=REAL_DTYPE)
-_VELOCITY_LIMIT = 2.0e4  # m / s
-_MAGNETIC_FIELD_LOWER = 1.0e-5  # tesla
-_MAGNETIC_FIELD_UPPER = 0.50  # tesla
-_INCLINATION_MARGIN = 1.0e-5  # radians away from singular vertical axes
-_AZIMUTH_LIMIT = 0.5 * jnp.pi  # principal interval for the pi-periodic azimuth
-
-# Maximum latent displacement introduced by the spatial network.  The first
-# five entries control T, ne, nHTot, vz, and vturb; the last three control the
-# magnetic strength, inclination, and azimuth. tanh makes every correction
-# smooth/bounded.
+# tanh outputs are always in [-1, 1]. Scales multiply these dimensionless
+# outputs: dex for positive fields, 20 km/s for velocity, pi and pi/2 for angles.
 DEFAULT_SPATIAL_SCALE = jnp.asarray(_SPATIAL_SCALE_VALUES, dtype=REAL_DTYPE)
 
 
@@ -154,33 +151,121 @@ class PerturbationConfig:
 class NeuralFieldConfig:
     """Architecture and bounded correction scale for the neural field."""
 
-    base_hidden: tuple[int, ...] = (128, 128, 128)
     spatial_hidden: tuple[int, ...] = (96, 96, 96)
-    base_frequencies: int = 6
     spatial_scale: tuple[float, ...] = _SPATIAL_SCALE_VALUES
 
     def validate(self) -> None:
-        if not self.base_hidden or not self.spatial_hidden:
-            raise ValueError("base and spatial networks need hidden layers")
-        if any(size <= 0 for size in (*self.base_hidden, *self.spatial_hidden)):
+        if not self.spatial_hidden:
+            raise ValueError("the spatial network needs hidden layers")
+        if any(not isinstance(size, int) or size <= 0 for size in self.spatial_hidden):
             raise ValueError("all hidden-layer sizes must be positive")
         if len(self.spatial_scale) != 8:
             raise ValueError("spatial_scale must contain eight values")
-        if not isinstance(self.base_frequencies, int) or self.base_frequencies < 0:
-            raise ValueError("base_frequencies must be a non-negative integer")
         if not all(
             math.isfinite(value) and value > 0.0 for value in self.spatial_scale
         ):
             raise ValueError("spatial correction scales must be positive and finite")
 
     @property
-    def base_layers(self) -> tuple[int, ...]:
-        n_features = 1 + 2 * self.base_frequencies
-        return (n_features, *self.base_hidden, 8)
-
-    @property
     def spatial_layers(self) -> tuple[int, ...]:
         return (3, *self.spatial_hidden, 8)
+
+
+class WandbRunLogger:
+    """Small optional adapter around a W&B run.
+
+    The W&B package is imported only when logging is explicitly requested, so
+    the core synthesis and inversion APIs retain no mandatory tracking
+    dependency. Device metrics are already materialized at epoch boundaries;
+    logging them here does not add accelerator synchronization points.
+    """
+
+    def __init__(
+        self,
+        wandb_module,
+        run,
+        *,
+        evaluation_every: int = DEFAULT_WANDB_EVALUATION_EVERY,
+        log_artifacts: bool = False,
+    ):
+        self.wandb = wandb_module
+        self.run = run
+
+        self.evaluation_every = _validate_positive_integer(
+            "wandb evaluation interval", evaluation_every
+        )
+        self.log_artifacts = bool(log_artifacts)
+
+        self.run.define_metric("inversion/epoch")
+        for metric in (
+            "inversion/train_total_loss",
+            "inversion/train_spectral_loss",
+            "inversion/train_prior",
+            "inversion/learning_rate",
+            "inversion/validation_full_wavelength_loss",
+            "inversion/best_validation_loss",
+        ):
+            self.run.define_metric(
+                metric,
+                step_metric="inversion/epoch",
+                summary="min",
+            )
+        self.run.define_metric(
+            "inversion/evaluation_figure",
+            step_metric="inversion/epoch",
+        )
+
+    def log_inversion_metrics(self, metrics: dict[str, float | int]) -> None:
+        """Log one already-synchronized inversion epoch record."""
+
+        self.run.log(dict(metrics))
+
+    def log_evaluation_figure(self, epoch: int, figure) -> None:
+        """Upload a current spectra/atmosphere comparison figure."""
+
+        self.run.log(
+            {
+                "inversion/epoch": int(epoch),
+                "inversion/evaluation_figure": self.wandb.Image(figure),
+            }
+        )
+
+    def update_config(self, values: dict) -> None:
+        self.run.config.update(_wandb_serializable(values))
+
+    def update_summary(self, values: dict) -> None:
+        for key, value in _wandb_serializable(values).items():
+            self.run.summary[key] = value
+
+    def track_file(
+        self,
+        path: str | Path,
+        *,
+        artifact_type: str,
+        role: str,
+    ) -> None:
+        """Optionally upload a local input or output file as a W&B Artifact."""
+
+        if not self.log_artifacts:
+            return
+        if role not in {"input", "output"}:
+            raise ValueError("W&B artifact role must be input or output")
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"W&B artifact file does not exist: {path}")
+        artifact = self.wandb.Artifact(
+            name=f"adora-pinn-{role}-{artifact_type}-{self.run.id}",
+            type=artifact_type,
+            metadata={"source_path": str(path.resolve()), "role": role},
+        )
+        artifact.add_file(str(path.resolve()), name=path.name)
+        if role == "input":
+            self.run.use_artifact(artifact)
+        else:
+            self.run.log_artifact(artifact)
+
+    def finish(self, exit_code: int) -> None:
+        self.run.finish(exit_code=exit_code)
 
 
 def _validate_positive_integer(name: str, value: int) -> int:
@@ -189,6 +274,154 @@ def _validate_positive_integer(name: str, value: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def _validate_learning_rate_range(initial: float, final: float) -> None:
+    """Validate a positive, monotonically decreasing learning-rate range."""
+
+    if not math.isfinite(initial) or initial <= 0.0:
+        raise ValueError("initial learning_rate must be positive and finite")
+    if not math.isfinite(final) or final <= 0.0:
+        raise ValueError("final_learning_rate must be positive and finite")
+    if final > initial:
+        raise ValueError("final_learning_rate must not exceed learning_rate")
+
+
+def sin_squared_learning_rate(
+    step,
+    total_steps: int,
+    initial_learning_rate: float = DEFAULT_INVERSION_INITIAL_LEARNING_RATE,
+    final_learning_rate: float = DEFAULT_INVERSION_FINAL_LEARNING_RATE,
+):
+    """Return a clipped sin-squared decay from ``initial`` to ``final``.
+
+    Optimizer update zero uses the initial rate and update
+    ``total_steps - 1`` uses the final rate. A one-update run necessarily uses
+    the initial rate because there is no interval over which to decay.
+    """
+
+    if not isinstance(total_steps, int):
+        raise TypeError("total_steps must be an integer")
+    if total_steps < 0:
+        raise ValueError("total_steps must be non-negative")
+    _validate_learning_rate_range(initial_learning_rate, final_learning_rate)
+    if total_steps <= 1:
+        return jnp.asarray(initial_learning_rate, dtype=REAL_DTYPE)
+    progress = jnp.clip(
+        jnp.asarray(step, dtype=REAL_DTYPE) / (total_steps - 1),
+        0.0,
+        1.0,
+    )
+    amplitude = initial_learning_rate - final_learning_rate
+    return (
+        final_learning_rate + amplitude * jnp.sin(0.5 * jnp.pi * (1.0 - progress)) ** 2
+    )
+
+
+def sin_squared_learning_rate_schedule(
+    total_steps: int,
+    initial_learning_rate: float = DEFAULT_INVERSION_INITIAL_LEARNING_RATE,
+    final_learning_rate: float = DEFAULT_INVERSION_FINAL_LEARNING_RATE,
+):
+    """Build the JAX-compatible learning-rate callable consumed by Optax."""
+
+    # Validate eagerly so bad CLI values fail before an expensive compilation.
+    sin_squared_learning_rate(
+        0,
+        total_steps,
+        initial_learning_rate,
+        final_learning_rate,
+    )
+
+    def schedule(step):
+        return sin_squared_learning_rate(
+            step,
+            total_steps,
+            initial_learning_rate,
+            final_learning_rate,
+        )
+
+    return schedule
+
+
+def _wandb_serializable(value):
+    """Convert CLI and NumPy values into W&B configuration primitives."""
+
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _wandb_serializable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_wandb_serializable(item) for item in value]
+    return value
+
+
+def _initialize_wandb(args, field_config: NeuralFieldConfig, wandb_module=None):
+    """Lazily initialize W&B for a parsed CLI invocation."""
+
+    if not args.wandb_project.strip():
+        raise ValueError("--wandb-project must be non-empty")
+
+    _validate_positive_integer("wandb evaluation interval", args.wandb_evaluation_every)
+    if wandb_module is None:
+        try:
+            wandb_module = importlib.import_module("wandb")
+        except ImportError as exc:
+            raise RuntimeError(
+                "W&B logging was requested but wandb is not installed; install "
+                "it with `python -m pip install -e '.[wandb]'` or "
+                "`python -m pip install wandb`"
+            ) from exc
+    if args.wandb_dir is not None:
+        args.wandb_dir.mkdir(parents=True, exist_ok=True)
+    if args.wandb_login:
+        login_succeeded = wandb_module.login()
+        if login_succeeded is False:
+            raise RuntimeError("wandb.login() did not authenticate successfully")
+
+    if args.generate_only:
+        job_type = "generate"
+    elif args.invert_only:
+        job_type = "invert"
+    else:
+        job_type = "generate-and-invert"
+    config = _wandb_serializable(vars(args))
+    config.update(
+        {
+            "workflow": job_type,
+            "parameterization": PARAMETERIZATION,
+            "effective_spatial_hidden": list(field_config.spatial_hidden),
+            "effective_spatial_scale": list(field_config.spatial_scale),
+        }
+    )
+    run = wandb_module.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        group=args.wandb_group,
+        tags=args.wandb_tags or None,
+        mode=args.wandb_mode,
+        dir=None if args.wandb_dir is None else str(args.wandb_dir.resolve()),
+        job_type=job_type,
+        config=config,
+    )
+    if run is None:
+        raise RuntimeError("wandb.init() did not return a run")
+    try:
+        return WandbRunLogger(
+            wandb_module,
+            run,
+            evaluation_every=args.wandb_evaluation_every,
+            log_artifacts=args.wandb_log_artifacts,
+        )
+    except BaseException:
+        try:
+            run.finish(exit_code=1)
+        except Exception:
+            pass
+        raise
 
 
 def _as_real(value) -> jax.Array:
@@ -290,19 +523,10 @@ def create_falc_reference_cube(
 
     _validate_positive_integer("nx", nx)
     _validate_positive_integer("ny", ny)
-    if (
-        not math.isfinite(magnetic_field_t)
-        or not _MAGNETIC_FIELD_LOWER < magnetic_field_t < _MAGNETIC_FIELD_UPPER
-    ):
-        raise ValueError(
-            "magnetic_field_t must lie inside the neural transform bounds "
-            f"({_MAGNETIC_FIELD_LOWER}, {_MAGNETIC_FIELD_UPPER}) T"
-        )
-    if (
-        not math.isfinite(inclination_rad)
-        or not _INCLINATION_MARGIN < inclination_rad < math.pi - _INCLINATION_MARGIN
-    ):
-        raise ValueError("inclination_rad must lie inside the neural transform margins")
+    if not math.isfinite(magnetic_field_t) or magnetic_field_t <= 0.0:
+        raise ValueError("magnetic_field_t must be positive for a log10 ratio")
+    if not math.isfinite(inclination_rad) or not 0.0 <= inclination_rad <= math.pi:
+        raise ValueError("inclination_rad must lie in [0, pi]")
     if not math.isfinite(azimuth_rad):
         raise ValueError("azimuth_rad must be finite")
 
@@ -441,10 +665,9 @@ def atomic_data_fingerprint(adata: AtomicData) -> str:
         digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
         digest.update(array.tobytes())
     runtime_digest = digest.hexdigest()
-    if (
-        getattr(adata, "canonical_sha256", None) is not None
-        and runtime_digest == getattr(adata, "runtime_sha256", None)
-    ):
+    if getattr(
+        adata, "canonical_sha256", None
+    ) is not None and runtime_digest == getattr(adata, "runtime_sha256", None):
         return adata.canonical_sha256
     return runtime_digest
 
@@ -522,8 +745,8 @@ def polarized_lte_rt_offset(
     absolute_wave = (
         jnp.asarray(adata.wavelength_reference_nm, dtype=eta.dtype) + wave_offset
     )
-    lower_boundary = jnp.zeros(4, dtype=eta.dtype).at[0].set(
-        planck(absolute_wave, temperature[0])
+    lower_boundary = (
+        jnp.zeros(4, dtype=eta.dtype).at[0].set(planck(absolute_wave, temperature[0]))
     )
     return delo_constant_fs_nonsingular(dz, lower_boundary, eta, chi)
 
@@ -755,9 +978,7 @@ def synthesize_atmosphere_cube(
     if len(shape) != 3:
         raise ValueError("a cube atmosphere must have shape (nx, ny, depth)")
     nx, ny, n_depth = shape
-    flat = Atmosphere(
-        *(_as_real(field).reshape((-1, n_depth)) for field in atmosphere)
-    )
+    flat = Atmosphere(*(_as_real(field).reshape((-1, n_depth)) for field in atmosphere))
     n_columns = nx * ny
     n_wave = int(absolute_wavelengths.shape[0])
     output = np.empty((n_columns, 4, n_wave), dtype=NUMPY_REAL_DTYPE)
@@ -790,145 +1011,73 @@ def synthesize_atmosphere_cube(
             wavelength_parallelism=wavelength_parallelism,
         ).block_until_ready()
         output[start:stop] = np.asarray(spectra[:count])
-    return jnp.asarray(
-        output.reshape((nx, ny, 4, n_wave)), dtype=REAL_DTYPE
-    )
-
-
-def _logit(probability):
-    probability = _as_real(probability)
-    # 1 - 1e-9 rounds back to exactly one in fp32.  A dtype-aware open
-    # interval prevents infinite logits and arctanh values in either mode.
-    epsilon = jnp.asarray(
-        max(1.0e-9, 4.0 * jnp.finfo(probability.dtype).eps),
-        dtype=probability.dtype,
-    )
-    probability = jnp.clip(probability, epsilon, 1.0 - epsilon)
-    return jnp.log(probability) - jnp.log1p(-probability)
-
-
-def _clip_open_unit_interval(value):
-    value = _as_real(value)
-    margin = jnp.asarray(
-        max(1.0e-9, 4.0 * jnp.finfo(value.dtype).eps), dtype=value.dtype
-    )
-    return jnp.clip(value, -1.0 + margin, 1.0 - margin)
+    return jnp.asarray(output.reshape((nx, ny, 4, n_wave)), dtype=REAL_DTYPE)
 
 
 def validate_neural_transform_domain(atmosphere: Atmosphere) -> None:
-    """Reject physical profiles that the bounded decoder cannot represent."""
+    """Require finite physical fields and positive multiplicative quantities."""
 
     _validate_atmosphere(atmosphere)
-    positive = jnp.stack(
-        (
-            atmosphere.temperature,
-            atmosphere.ne,
-            atmosphere.nhtot,
-            atmosphere.vturb,
-        ),
-        axis=-1,
-    )
-    if not bool(jnp.all((positive > _POSITIVE_LOWER) & (positive < _POSITIVE_UPPER))):
-        raise ValueError("positive atmosphere fields exceed neural transform bounds")
-    if not bool(jnp.all(jnp.abs(atmosphere.vz) < _VELOCITY_LIMIT)):
-        raise ValueError("LOS velocity exceeds neural transform bounds")
-    if not bool(
-        jnp.all(
-            (atmosphere.b > _MAGNETIC_FIELD_LOWER)
-            & (atmosphere.b < _MAGNETIC_FIELD_UPPER)
-        )
-    ):
-        raise ValueError("magnetic field exceeds neural transform bounds")
-    if not bool(
-        jnp.all(
-            (atmosphere.gamma_b > _INCLINATION_MARGIN)
-            & (atmosphere.gamma_b < jnp.pi - _INCLINATION_MARGIN)
-        )
-    ):
-        raise ValueError("inclination exceeds neural transform bounds")
-    if not bool(jnp.all(jnp.abs(_wrap_azimuth(atmosphere.chi_b)) < _AZIMUTH_LIMIT)):
-        raise ValueError("azimuth lies on a neural transform boundary")
 
 
-def atmosphere_to_latent(atmosphere: Atmosphere) -> jax.Array:
-    """Encode a physical atmosphere into the network's eight latent channels."""
+def atmosphere_to_corrections(atmosphere: Atmosphere, reference: Atmosphere):
+    """Encode log10(q/q_ref) and scaled additive velocity/angle changes.
 
-    if not isinstance(atmosphere.b, jax.core.Tracer):
-        validate_neural_transform_domain(atmosphere)
+    The reference may be one depth profile or a broadcast-compatible sampled
+    atmosphere. Azimuth differences use the shortest pi-periodic displacement.
+    """
 
-    positive = jnp.stack(
-        (
-            atmosphere.temperature,
-            atmosphere.ne,
-            atmosphere.nhtot,
-            atmosphere.vturb,
-        ),
-        axis=-1,
-    )
-    log_lower = jnp.log(_POSITIVE_LOWER)
-    log_span = jnp.log(_POSITIVE_UPPER) - log_lower
-    positive_unit = (jnp.log(positive) - log_lower) / log_span
-    positive_latent = _logit(positive_unit)
-    velocity_latent = jnp.arctanh(
-        _clip_open_unit_interval(atmosphere.vz / _VELOCITY_LIMIT)
-    )
-    magnetic_log_lower = jnp.log(_MAGNETIC_FIELD_LOWER)
-    magnetic_log_span = jnp.log(_MAGNETIC_FIELD_UPPER) - magnetic_log_lower
-    magnetic_unit = (jnp.log(atmosphere.b) - magnetic_log_lower) / magnetic_log_span
-    magnetic_latent = _logit(magnetic_unit)
-    inclination_span = jnp.pi - 2.0 * _INCLINATION_MARGIN
-    inclination_unit = (atmosphere.gamma_b - _INCLINATION_MARGIN) / inclination_span
-    inclination_latent = _logit(inclination_unit)
-    azimuth_latent = jnp.arctanh(
-        _clip_open_unit_interval(
-            _wrap_azimuth(atmosphere.chi_b) / _AZIMUTH_LIMIT
-        )
-    )
     return jnp.stack(
-        (
-            positive_latent[..., 0],
-            positive_latent[..., 1],
-            positive_latent[..., 2],
-            velocity_latent,
-            positive_latent[..., 3],
-            magnetic_latent,
-            inclination_latent,
-            azimuth_latent,
+        tuple(
+            jnp.log10(_as_real(value) / _as_real(baseline))
+            if index in (0, 1, 2, 4, 5)
+            else (
+                _wrap_azimuth(_as_real(value) - _as_real(baseline)) / _AZIMUTH_SCALE
+                if index == 7
+                else (_as_real(value) - _as_real(baseline))
+                / (_VELOCITY_SCALE if index == 3 else _INCLINATION_SCALE)
+            )
+            for index, (value, baseline) in enumerate(zip(atmosphere, reference))
         ),
         axis=-1,
     )
 
 
-def latent_to_atmosphere(latent) -> Atmosphere:
-    """Smoothly decode latent channels to finite, physical atmospheric fields."""
+def corrections_to_atmosphere(corrections, reference: Atmosphere) -> Atmosphere:
+    """Perturb the exact reference at each height using physical corrections.
 
-    latent = _as_real(latent)
-    if latent.shape[-1] != 8:
-        raise ValueError("latent atmosphere must have eight channels")
-    positive_latent = jnp.stack(
-        (latent[..., 0], latent[..., 1], latent[..., 2], latent[..., 4]),
-        axis=-1,
+    Positive quantities multiply by 10**correction. Signed velocity and angles
+    use additive offsets, which also work at zero reference velocity/azimuth.
+    Inclinations outside [0, pi] are reflected to the equivalent inclination;
+    the polarized solver is invariant to this reflection (sin² gamma, cos gamma).
+    The usual [0, pi] branch is unchanged, including at zero correction.
+    """
+
+    corrections = _as_real(corrections)
+    if corrections.shape[-1] != 8:
+        raise ValueError("atmosphere corrections must have eight channels")
+    reference = jax.tree.map(jax.lax.stop_gradient, reference)
+    fields = [
+        _as_real(baseline) * jnp.power(10.0, corrections[..., index])
+        if index in (0, 1, 2, 4, 5)
+        else _as_real(baseline)
+        + corrections[..., index]
+        * (
+            _VELOCITY_SCALE
+            if index == 3
+            else _INCLINATION_SCALE
+            if index == 6
+            else _AZIMUTH_SCALE
+        )
+        for index, baseline in enumerate(reference)
+    ]
+    inclination = fields[6]
+    fields[6] = jnp.where(
+        (inclination >= 0.0) & (inclination <= jnp.pi),
+        inclination,
+        jnp.pi - jnp.abs(jnp.pi - jnp.mod(inclination, 2.0 * jnp.pi)),
     )
-    log_lower = jnp.log(_POSITIVE_LOWER)
-    log_span = jnp.log(_POSITIVE_UPPER) - log_lower
-    positive = jnp.exp(log_lower + log_span * jax.nn.sigmoid(positive_latent))
-    vz = _VELOCITY_LIMIT * jnp.tanh(latent[..., 3])
-    magnetic_log_lower = jnp.log(_MAGNETIC_FIELD_LOWER)
-    magnetic_log_span = jnp.log(_MAGNETIC_FIELD_UPPER) - magnetic_log_lower
-    b = jnp.exp(magnetic_log_lower + magnetic_log_span * jax.nn.sigmoid(latent[..., 5]))
-    inclination_span = jnp.pi - 2.0 * _INCLINATION_MARGIN
-    gamma_b = _INCLINATION_MARGIN + inclination_span * jax.nn.sigmoid(latent[..., 6])
-    chi_b = _AZIMUTH_LIMIT * jnp.tanh(latent[..., 7])
-    return Atmosphere(
-        positive[..., 0],
-        positive[..., 1],
-        positive[..., 2],
-        vz,
-        positive[..., 3],
-        b,
-        gamma_b,
-        chi_b,
-    )
+    return Atmosphere(*fields)
 
 
 def validate_spatial_reachability(
@@ -936,30 +1085,33 @@ def validate_spatial_reachability(
     truth: Atmosphere,
     spatial_scale=DEFAULT_SPATIAL_SCALE,
 ) -> None:
-    """Ensure a frozen FAL base can reach every truth latent channel."""
+    """Ensure the truth fits within the bounded reference-relative outputs."""
 
-    reference_latent = atmosphere_to_latent(reference)
-    truth_latent = atmosphere_to_latent(truth)
-    if truth_latent.ndim != reference_latent.ndim + 2 or truth_latent.shape[-2:] != (
-        reference_latent.shape[0],
-        8,
+    validate_neural_transform_domain(reference)
+    validate_neural_transform_domain(truth)
+    if (
+        reference.temperature.ndim != 1
+        or truth.temperature.shape[-1:] != (reference.temperature.size,)
+        or truth.temperature.ndim != 3
     ):
         raise ValueError("truth and reference depth/channel dimensions do not match")
     spatial_scale = _as_real(spatial_scale)
-    if spatial_scale.shape != (8,) or not bool(jnp.all(spatial_scale > 0.0)):
-        raise ValueError("spatial_scale must contain eight positive values")
+    if spatial_scale.shape != (8,) or not bool(
+        jnp.all(jnp.isfinite(spatial_scale) & (spatial_scale > 0.0))
+    ):
+        raise ValueError("spatial_scale must contain eight positive finite values")
     required = jnp.max(
-        jnp.abs(truth_latent - reference_latent[None, None, ...]),
-        axis=(0, 1, 2),
+        jnp.abs(atmosphere_to_corrections(truth, reference)), axis=(0, 1, 2)
     )
     if not bool(jnp.all(required < spatial_scale)):
-        ratios = np.asarray(required / spatial_scale)
         failing = [
-            LATENT_CHANNEL_NAMES[index] for index in np.flatnonzero(ratios >= 1.0)
+            CORRECTION_CHANNEL_NAMES[index]
+            for index in np.flatnonzero(np.asarray(required >= spatial_scale))
         ]
         raise ValueError(
-            "truth perturbation exceeds the frozen spatial correction range for: "
+            "truth perturbation exceeds the reference-relative correction range for: "
             + ", ".join(failing)
+            + "; increase --spatial-scale"
         )
 
 
@@ -976,9 +1128,7 @@ def init_mlp(layer_sizes, key, zero_output: bool = False):
     ):
         weight = jax.random.normal(
             layer_key, (n_in, n_out), dtype=REAL_DTYPE
-        ) * jnp.sqrt(
-            2.0 / (n_in + n_out)
-        )
+        ) * jnp.sqrt(2.0 / (n_in + n_out))
         bias = jnp.zeros(n_out, dtype=REAL_DTYPE)
         if zero_output and index == len(layer_sizes) - 2:
             weight = jnp.zeros_like(weight)
@@ -996,62 +1146,68 @@ def apply_mlp(params, coordinates):
     return activation @ params[-1]["w"] + params[-1]["b"]
 
 
-def vertical_features(z_coordinates, n_frequencies: int):
-    """Fourier-encode height so the base MLP can resolve FAL-C's transition."""
-
-    z_coordinates = _as_real(z_coordinates)
-    if z_coordinates.shape[-1] != 1:
-        raise ValueError("vertical coordinates must have one feature")
-    if not isinstance(n_frequencies, int) or n_frequencies < 0:
-        raise ValueError("n_frequencies must be a non-negative integer")
-    if n_frequencies == 0:
-        return z_coordinates
-    frequencies = 2.0 ** jnp.arange(n_frequencies, dtype=z_coordinates.dtype)
-    angles = jnp.pi * z_coordinates * frequencies
-    return jnp.concatenate((z_coordinates, jnp.sin(angles), jnp.cos(angles)), axis=-1)
-
-
-def _base_features(params, z_coordinates):
-    input_features = int(params[0]["w"].shape[0])
-    if input_features < 1 or (input_features - 1) % 2:
-        raise ValueError("base-network input size is not a valid Fourier encoding")
-    return vertical_features(z_coordinates, (input_features - 1) // 2)
+def _validate_reference(reference: Atmosphere, height_normalized) -> None:
+    z = np.asarray(height_normalized)
+    if (
+        z.ndim != 1
+        or z.size < 2
+        or not np.all(np.isfinite(z))
+        or np.any(np.diff(z) <= 0.0)
+        or z[0] != 0.0
+        or z[-1] != 1.0
+    ):
+        raise ValueError("reference heights must increase from 0 to 1")
+    _validate_atmosphere(reference, expected_shape=z.shape)
 
 
 def initialize_neural_field(
     key,
+    reference: Atmosphere,
+    height_normalized,
     config: NeuralFieldConfig = NeuralFieldConfig(),
 ):
-    """Initialize the learned vertical base and zero spatial correction."""
+    """Bind a fixed reference and initialize exactly zero spatial outputs.
+
+    Hidden layers retain random weights; only the final layer is zero. This
+    gives an exact identity atmosphere without a pretraining optimizer pass.
+    Reference profiles are data, never trainable parameters.
+    """
 
     config.validate()
-    base_key, spatial_key = jax.random.split(key)
+    _validate_reference(reference, height_normalized)
     return {
-        "base": init_mlp(config.base_layers, base_key),
-        "spatial": init_mlp(config.spatial_layers, spatial_key, zero_output=True),
+        "reference": {
+            "height_normalized": _as_real(height_normalized),
+            "atmosphere": Atmosphere(*(_as_real(field) for field in reference)),
+        },
+        "spatial": init_mlp(config.spatial_layers, key, zero_output=True),
     }
 
 
-def neural_field_latent(
-    params,
-    coordinates,
-    spatial_scale=DEFAULT_SPATIAL_SCALE,
-):
-    """Return combined latent field and the bounded spatial correction."""
+def reference_at_coordinates(params, coordinates) -> Atmosphere:
+    """Interpolate fixed reference profiles at the requested normalized heights.
+
+    At the stored depth grid this returns the original reference exactly. The
+    physical profiles are linearly interpolated for intermediate heights.
+    """
 
     coordinates = _as_real(coordinates)
     if coordinates.shape[-1] != 3:
         raise ValueError("coordinates must have a final (x, y, z) axis")
-    spatial_scale = _as_real(spatial_scale)
-    if spatial_scale.shape != (8,):
-        raise ValueError("spatial_scale must have shape (8,)")
-    base_latent = apply_mlp(
-        params["base"], _base_features(params["base"], coordinates[..., 2:3])
+    reference = jax.tree.map(jax.lax.stop_gradient, params["reference"])
+    z = 2.0 * reference["height_normalized"] - 1.0
+    return Atmosphere(
+        *(
+            jnp.interp(coordinates[..., 2], z, field)
+            for field in reference["atmosphere"]
+        )
     )
-    spatial_correction = spatial_scale * jnp.tanh(
-        apply_mlp(params["spatial"], coordinates)
-    )
-    return base_latent + spatial_correction, spatial_correction
+
+
+def neural_field_output(params, coordinates):
+    """Return eight dimensionless correction channels bounded to [-1, 1]."""
+
+    return jnp.tanh(apply_mlp(params["spatial"], coordinates))
 
 
 def evaluate_neural_field(
@@ -1059,13 +1215,20 @@ def evaluate_neural_field(
     coordinates,
     spatial_scale=DEFAULT_SPATIAL_SCALE,
 ) -> Atmosphere:
-    """Evaluate the neural atmosphere at normalized ``(x, y, z)`` coordinates."""
+    """Evaluate the fixed reference perturbed by the current neural outputs."""
 
-    latent, _ = neural_field_latent(params, coordinates, spatial_scale)
-    return latent_to_atmosphere(latent)
+    reference = reference_at_coordinates(params, coordinates)
+    corrections = _as_real(spatial_scale) * neural_field_output(params, coordinates)
+    return corrections_to_atmosphere(corrections, reference)
 
 
-_EVALUATE_NEURAL_FIELD_JIT = jax.jit(evaluate_neural_field)
+def _evaluate_field_and_output(params, coordinates, spatial_scale):
+    output = neural_field_output(params, coordinates)
+    reference = reference_at_coordinates(params, coordinates)
+    return corrections_to_atmosphere(spatial_scale * output, reference), output
+
+
+_EVALUATE_NEURAL_FIELD_JIT = jax.jit(_evaluate_field_and_output)
 
 
 def evaluate_neural_field_cube(
@@ -1074,7 +1237,8 @@ def evaluate_neural_field_cube(
     spatial_scale=DEFAULT_SPATIAL_SCALE,
     batch_columns: int = 16,
     show_progress: bool = True,
-) -> Atmosphere:
+    return_corrections: bool = False,
+):
     """Evaluate a full ``(x,y,z)`` neural cube in bounded-memory chunks."""
 
     batch_columns = _validate_positive_integer("batch_columns", batch_columns)
@@ -1085,9 +1249,13 @@ def evaluate_neural_field_cube(
     n_columns = nx * ny
     flat_coordinates = coordinates.reshape((n_columns, n_depth, 3))
     outputs = [
-        np.empty((n_columns, n_depth), dtype=NUMPY_REAL_DTYPE)
-        for _ in FIELD_NAMES
+        np.empty((n_columns, n_depth), dtype=NUMPY_REAL_DTYPE) for _ in FIELD_NAMES
     ]
+    correction_output = (
+        np.empty((n_columns, n_depth, 8), dtype=NUMPY_REAL_DTYPE)
+        if return_corrections
+        else None
+    )
     iterator = tqdm(
         range(0, n_columns, batch_columns),
         total=math.ceil(n_columns / batch_columns),
@@ -1106,117 +1274,23 @@ def evaluate_neural_field_cube(
                 ),
                 axis=0,
             )
-        atmosphere = _EVALUATE_NEURAL_FIELD_JIT(
+        atmosphere, normalized_output = _EVALUATE_NEURAL_FIELD_JIT(
             params, batch, _as_real(spatial_scale)
         )
         jax.block_until_ready(atmosphere.temperature)
+        if return_corrections:
+            correction_output[start:stop] = np.asarray(normalized_output[:count])
         for output, field in zip(outputs, atmosphere):
             output[start:stop] = np.asarray(field[:count])
-    return Atmosphere(
+    atmosphere = Atmosphere(
         *(
             jnp.asarray(output.reshape((nx, ny, n_depth)), dtype=REAL_DTYPE)
             for output in outputs
         )
     )
-
-
-def pretrain_falc(
-    params,
-    z_coordinates,
-    reference: Atmosphere,
-    steps: int = 2000,
-    learning_rate: float = 2.0e-3,
-    tolerance: float | None = None,
-    show_progress: bool = True,
-):
-    """Supervise the vertical network on FAL-C and leave spatial output zero."""
-
-    if not isinstance(steps, int) or steps < 0:
-        raise ValueError("steps must be a non-negative integer")
-    if not math.isfinite(learning_rate) or learning_rate <= 0.0:
-        raise ValueError("learning_rate must be positive and finite")
-    if tolerance is not None and (not math.isfinite(tolerance) or tolerance <= 0.0):
-        raise ValueError("tolerance must be positive and finite when supplied")
-    z_coordinates = _as_real(z_coordinates)
-    if z_coordinates.ndim != 1:
-        raise ValueError("z_coordinates must be one-dimensional")
-    _validate_atmosphere(reference, expected_shape=(z_coordinates.size,))
-    target = atmosphere_to_latent(reference)
-    network_input = _base_features(
-        params["base"], (2.0 * z_coordinates - 1.0).reshape((-1, 1))
-    )
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate))
-    base_params = params["base"]
-    opt_state = optimizer.init(base_params)
-
-    def loss_fn(candidate):
-        prediction = apply_mlp(candidate, network_input)
-        return jnp.mean((prediction - target) ** 2)
-
-    def step(base, state):
-        loss_value, grads = jax.value_and_grad(loss_fn)(base)
-        updates, next_state = optimizer.update(grads, state, base)
-        return optax.apply_updates(base, updates), next_state, loss_value
-
-    def run_pretraining(base, state):
-        initial_loss = loss_fn(base)
-
-        def scan_step(carry, _):
-            current, current_state, best, best_loss = carry
-            next_params, next_state, loss_value = step(current, current_state)
-            improved = loss_value < best_loss
-            best = jax.tree.map(
-                lambda best_leaf, current_leaf: jnp.where(
-                    improved, current_leaf, best_leaf
-                ),
-                best,
-                current,
-            )
-            best_loss = jnp.where(improved, loss_value, best_loss)
-            return (next_params, next_state, best, best_loss), loss_value
-
-        (base, state, best, best_loss), loss_history = jax.lax.scan(
-            scan_step,
-            (base, state, base, initial_loss),
-            xs=None,
-            length=steps,
-        )
-        final_loss = loss_fn(base)
-        improved = final_loss < best_loss
-        best = jax.tree.map(
-            lambda best_leaf, final_leaf: jnp.where(
-                improved, final_leaf, best_leaf
-            ),
-            best,
-            base,
-        )
-        best_loss = jnp.where(improved, final_loss, best_loss)
-        return best, jnp.concatenate((loss_history, final_loss[None])), best_loss
-
-    compiled_pretraining = jax.jit(run_pretraining)
-    iterator = tqdm(
-        total=steps,
-        desc="Pretraining FAL-C",
-        disable=not show_progress,
-    )
-    best_params, all_losses, _ = compiled_pretraining(base_params, opt_state)
-    # Materialize the complete trace once; the previous loop synchronized the
-    # accelerator for every scalar loss value.
-    all_losses = np.asarray(all_losses, dtype=float)
-    history = all_losses[:-1]
-    best_loss = float(np.min(all_losses))
-    iterator.update(steps)
-    if steps:
-        iterator.set_postfix(loss=f"{history[-1]:.3e}")
-    iterator.close()
-    if tolerance is not None and steps > 0 and best_loss > tolerance:
-        raise RuntimeError(
-            "FAL-C pretraining did not reach the requested latent MSE: "
-            f"best={best_loss:.3e}, tolerance={tolerance:.3e}; increase "
-            "--pretrain-steps or network capacity"
-        )
-
-    return {"base": best_params, "spatial": params["spatial"]}, history
+    if return_corrections:
+        return atmosphere, correction_output.reshape((nx, ny, n_depth, 8))
+    return atmosphere
 
 
 def continuum_normalization(observed_stokes):
@@ -1282,10 +1356,12 @@ def neural_spectral_loss(
     centered without recovering precision that was lost during that transfer.
     """
 
-    latent, spatial_correction = neural_field_latent(params, coordinates, spatial_scale)
-    return _latent_spectral_loss_impl(
-        latent,
-        spatial_correction,
+    normalized_output = neural_field_output(params, coordinates)
+    reference = reference_at_coordinates(params, coordinates)
+    return _relative_spectral_loss_impl(
+        reference,
+        normalized_output,
+        spatial_scale,
         wavelengths,
         observed_stokes,
         continuum,
@@ -1315,10 +1391,12 @@ def neural_spectral_loss_offset(
 ):
     """Physics-informed objective from host-precentered wavelength offsets."""
 
-    latent, spatial_correction = neural_field_latent(params, coordinates, spatial_scale)
-    return _latent_spectral_loss_impl(
-        latent,
-        spatial_correction,
+    normalized_output = neural_field_output(params, coordinates)
+    reference = reference_at_coordinates(params, coordinates)
+    return _relative_spectral_loss_impl(
+        reference,
+        normalized_output,
+        spatial_scale,
         wavelength_offsets_nm,
         observed_stokes,
         continuum,
@@ -1332,9 +1410,10 @@ def neural_spectral_loss_offset(
     )
 
 
-def _latent_spectral_loss_impl(
-    latent,
-    spatial_correction,
+def _relative_spectral_loss_impl(
+    reference,
+    normalized_output,
+    spatial_scale,
     wavelengths,
     observed_stokes,
     continuum,
@@ -1347,7 +1426,9 @@ def _latent_spectral_loss_impl(
     *,
     wavelengths_are_offsets,
 ):
-    atmosphere = latent_to_atmosphere(latent)
+    atmosphere = corrections_to_atmosphere(
+        _as_real(spatial_scale) * normalized_output, reference
+    )
     synthesis = (
         _synthesize_columns_offset_core
         if wavelengths_are_offsets
@@ -1367,7 +1448,7 @@ def _latent_spectral_loss_impl(
         stokes_weights,
         column_mask,
     )
-    per_column_prior = jnp.mean(spatial_correction**2, axis=(1, 2))
+    per_column_prior = jnp.mean(normalized_output**2, axis=(1, 2))
     if column_mask is None:
         prior = jnp.mean(per_column_prior)
     else:
@@ -1377,9 +1458,9 @@ def _latent_spectral_loss_impl(
     return spectral_loss + prior_weight * prior, (spectral_loss, prior)
 
 
-def frozen_base_spectral_loss(
+def reference_spectral_loss(
     spatial_params,
-    base_latent,
+    reference,
     coordinates,
     wavelengths,
     observed_stokes,
@@ -1394,13 +1475,11 @@ def frozen_base_spectral_loss(
 ):
     """Spectral loss that differentiates only the trainable spatial network."""
 
-    spatial_correction = _as_real(spatial_scale) * jnp.tanh(
-        apply_mlp(spatial_params, coordinates)
-    )
-    latent = jax.lax.stop_gradient(base_latent)[None, ...] + spatial_correction
-    return _latent_spectral_loss_impl(
-        latent,
-        spatial_correction,
+    normalized_output = jnp.tanh(apply_mlp(spatial_params, coordinates))
+    return _relative_spectral_loss_impl(
+        reference,
+        normalized_output,
+        spatial_scale,
         wavelengths,
         observed_stokes,
         continuum,
@@ -1414,9 +1493,9 @@ def frozen_base_spectral_loss(
     )
 
 
-def frozen_base_spectral_loss_offset(
+def reference_spectral_loss_offset(
     spatial_params,
-    base_latent,
+    reference,
     coordinates,
     wavelength_offsets_nm,
     observed_stokes,
@@ -1429,15 +1508,13 @@ def frozen_base_spectral_loss_offset(
     prior_weight: float = 0.0,
     wavelength_parallelism: int = 1,
 ):
-    """Frozen-base loss using precision-safe centered wavelengths."""
+    """Fixed-reference loss using precision-safe centered wavelengths."""
 
-    spatial_correction = _as_real(spatial_scale) * jnp.tanh(
-        apply_mlp(spatial_params, coordinates)
-    )
-    latent = jax.lax.stop_gradient(base_latent)[None, ...] + spatial_correction
-    return _latent_spectral_loss_impl(
-        latent,
-        spatial_correction,
+    normalized_output = jnp.tanh(apply_mlp(spatial_params, coordinates))
+    return _relative_spectral_loss_impl(
+        reference,
+        normalized_output,
+        spatial_scale,
         wavelength_offsets_nm,
         observed_stokes,
         continuum,
@@ -1524,18 +1601,26 @@ def train_spectral_inversion(
     epochs: int = 10,
     batch_columns: int = 8,
     wavelength_batch: int = 48,
-    learning_rate: float = 3.0e-4,
+    learning_rate: float = DEFAULT_INVERSION_INITIAL_LEARNING_RATE,
+    final_learning_rate: float = DEFAULT_INVERSION_FINAL_LEARNING_RATE,
     stokes_weights=(1.0, 5.0, 5.0, 2.0),
     spatial_scale=DEFAULT_SPATIAL_SCALE,
     prior_weight: float = 1.0e-5,
-    fine_tune_base: bool = False,
     require_improvement: bool = True,
     seed: int = 0,
     show_progress: bool = True,
     wavelength_parallelism: int = DEFAULT_WAVELENGTH_PARALLELISM,
     validation_columns: int = DEFAULT_VALIDATION_COLUMNS,
+    metrics_callback: Callable[[dict[str, float | int]], None] | None = None,
+    evaluation_callback: Callable[[int, dict], None] | None = None,
+    evaluation_every: int = DEFAULT_WANDB_EVALUATION_EVERY,
 ):
-    """Fit the shared neural field using shuffled complete-column batches."""
+    """Fit the shared neural field using shuffled complete-column batches.
+
+    The Adam learning rate follows a sin-squared decay at optimizer-update
+    granularity. Optional evaluations run at epoch zero, every
+    ``evaluation_every`` epochs, and at the final epoch.
+    """
 
     if not isinstance(epochs, int) or epochs < 0:
         raise ValueError("epochs must be a non-negative integer")
@@ -1547,8 +1632,11 @@ def train_spectral_inversion(
     validation_columns = _validate_positive_integer(
         "validation_columns", validation_columns
     )
-    if not math.isfinite(learning_rate) or learning_rate <= 0.0:
-        raise ValueError("learning_rate must be positive and finite")
+    _validate_learning_rate_range(learning_rate, final_learning_rate)
+    if evaluation_callback is not None:
+        evaluation_every = _validate_positive_integer(
+            "evaluation_every", evaluation_every
+        )
     if not math.isfinite(prior_weight) or prior_weight < 0.0:
         raise ValueError("prior_weight must be non-negative and finite")
 
@@ -1604,69 +1692,48 @@ def train_spectral_inversion(
     ):
         raise ValueError("all columns must use the same ordered height coordinates")
     continuum = continuum_normalization(observed_stokes)
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate))
+    n_columns = coordinates.shape[0]
+    updates_per_epoch = math.ceil(n_columns / batch_columns)
+    total_optimizer_steps = epochs * updates_per_epoch
+    learning_rate_schedule = sin_squared_learning_rate_schedule(
+        total_optimizer_steps,
+        learning_rate,
+        final_learning_rate,
+    )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate_schedule),
+    )
 
-    base_params = params["base"]
-    if fine_tune_base:
-        trainable = params
+    trainable = params["spatial"]
+    reference = reference_at_coordinates(params, coordinates[0])
 
-        def batch_loss(
+    def batch_loss(
+        candidate,
+        batch_coordinates,
+        batch_wavelengths,
+        batch_observed,
+        batch_continuum,
+        batch_mask,
+    ):
+        return reference_spectral_loss_offset(
             candidate,
+            reference,
             batch_coordinates,
             batch_wavelengths,
             batch_observed,
             batch_continuum,
+            dz,
+            adata,
+            spatial_scale,
+            stokes_weights,
             batch_mask,
-        ):
-            return neural_spectral_loss_offset(
-                candidate,
-                batch_coordinates,
-                batch_wavelengths,
-                batch_observed,
-                batch_continuum,
-                dz,
-                adata,
-                spatial_scale,
-                stokes_weights,
-                batch_mask,
-                prior_weight,
-                wavelength_parallelism,
-            )
+            prior_weight,
+            wavelength_parallelism,
+        )
 
-        def assemble(candidate):
-            return candidate
-
-    else:
-        trainable = params["spatial"]
-        z_coordinates = coordinates[0, :, 2:3]
-        base_latent = apply_mlp(base_params, _base_features(base_params, z_coordinates))
-
-        def batch_loss(
-            candidate,
-            batch_coordinates,
-            batch_wavelengths,
-            batch_observed,
-            batch_continuum,
-            batch_mask,
-        ):
-            return frozen_base_spectral_loss_offset(
-                candidate,
-                base_latent,
-                batch_coordinates,
-                batch_wavelengths,
-                batch_observed,
-                batch_continuum,
-                dz,
-                adata,
-                spatial_scale,
-                stokes_weights,
-                batch_mask,
-                prior_weight,
-                wavelength_parallelism,
-            )
-
-        def assemble(candidate):
-            return {"base": base_params, "spatial": candidate}
+    def assemble(candidate):
+        return {"reference": params["reference"], "spatial": candidate}
 
     opt_state = optimizer.init(trainable)
 
@@ -1697,7 +1764,6 @@ def train_spectral_inversion(
         return next_params, next_state, metrics
 
     rng = np.random.default_rng(seed)
-    n_columns = coordinates.shape[0]
     history = np.empty((epochs, 3), dtype=float)
 
     validation_count = min(validation_columns, n_columns)
@@ -1789,11 +1855,22 @@ def train_spectral_inversion(
 
     compiled_epoch = jax.jit(train_epoch)
     validation_history = np.empty(epochs + 1, dtype=float)
-    validation_history[0] = float(
-        compiled_validation(trainable, *validation_arguments)
-    )
+    validation_history[0] = float(compiled_validation(trainable, *validation_arguments))
     best_validation = validation_history[0]
     best_trainable = trainable
+    if metrics_callback is not None:
+        metrics_callback(
+            {
+                "inversion/epoch": 0,
+                "inversion/learning_rate": float(np.asarray(learning_rate_schedule(0))),
+                "inversion/validation_full_wavelength_loss": float(
+                    validation_history[0]
+                ),
+                "inversion/best_validation_loss": float(best_validation),
+            }
+        )
+    if evaluation_callback is not None:
+        evaluation_callback(0, assemble(trainable))
     epoch_iterator = tqdm(
         range(epochs),
         desc="Inverting Stokes cube",
@@ -1837,6 +1914,13 @@ def train_spectral_inversion(
         )
         history[epoch] = epoch_metrics[:3]
         validation_history[epoch + 1] = epoch_metrics[3]
+        completed_update = min(
+            (epoch + 1) * updates_per_epoch - 1,
+            max(total_optimizer_steps - 1, 0),
+        )
+        current_learning_rate = float(
+            np.asarray(learning_rate_schedule(completed_update))
+        )
         if validation_history[epoch + 1] < best_validation:
             best_validation = validation_history[epoch + 1]
             best_trainable = trainable
@@ -1844,7 +1928,27 @@ def train_spectral_inversion(
             loss=f"{history[epoch, 0]:.3e}",
             spectral=f"{history[epoch, 1]:.3e}",
             validation=f"{validation_history[epoch + 1]:.3e}",
+            lr=f"{current_learning_rate:.2e}",
         )
+        if metrics_callback is not None:
+            metrics_callback(
+                {
+                    "inversion/epoch": int(epoch + 1),
+                    "inversion/train_total_loss": float(history[epoch, 0]),
+                    "inversion/train_spectral_loss": float(history[epoch, 1]),
+                    "inversion/train_prior": float(history[epoch, 2]),
+                    "inversion/learning_rate": current_learning_rate,
+                    "inversion/validation_full_wavelength_loss": float(
+                        validation_history[epoch + 1]
+                    ),
+                    "inversion/best_validation_loss": float(best_validation),
+                }
+            )
+        completed_epoch = epoch + 1
+        if evaluation_callback is not None and (
+            completed_epoch % evaluation_every == 0 or completed_epoch == epochs
+        ):
+            evaluation_callback(completed_epoch, assemble(trainable))
     if (
         require_improvement
         and epochs > 0
@@ -2043,6 +2147,92 @@ def load_test_cube(path=DEFAULT_DATASET):
     return payload
 
 
+def validate_spectra_output(payload) -> tuple[int, int, int]:
+    """Validate the compact input/output spectra interchange archive."""
+
+    required = {
+        "schema_version",
+        "stokes_labels",
+        "x_normalized",
+        "y_normalized",
+        "wavelength_nm",
+        "input_stokes",
+        "output_stokes",
+    }
+    missing = required.difference(payload)
+    if missing:
+        raise ValueError(
+            "spectra output is missing keys: " + ", ".join(sorted(missing))
+        )
+    if int(np.asarray(payload["schema_version"])) != SPECTRA_SCHEMA_VERSION:
+        raise ValueError("unsupported spectra output schema version")
+    if tuple(str(value) for value in payload["stokes_labels"]) != STOKES_LABELS:
+        raise ValueError("stokes_labels must be ordered as I, Q, U, V")
+    x = np.asarray(payload["x_normalized"], dtype=float)
+    y = np.asarray(payload["y_normalized"], dtype=float)
+    wavelength = np.asarray(payload["wavelength_nm"], dtype=float)
+    for name, axis in (("x_normalized", x), ("y_normalized", y)):
+        if axis.ndim != 1 or axis.size == 0 or np.any(~np.isfinite(axis)):
+            raise ValueError(f"{name} must be a non-empty finite axis")
+        if axis.size > 1 and np.any(np.diff(axis) <= 0.0):
+            raise ValueError(f"{name} must be strictly increasing")
+    if (
+        wavelength.ndim != 1
+        or wavelength.size == 0
+        or np.any(~np.isfinite(wavelength))
+        or np.any(wavelength <= 0.0)
+        or (wavelength.size > 1 and np.any(np.diff(wavelength) <= 0.0))
+    ):
+        raise ValueError("wavelength_nm must be a positive increasing finite axis")
+    expected_shape = (x.size, y.size, 4, wavelength.size)
+    for key in ("input_stokes", "output_stokes"):
+        spectra = np.asarray(payload[key])
+        if spectra.shape != expected_shape or np.any(~np.isfinite(spectra)):
+            raise ValueError(f"{key} must have finite shape {expected_shape}")
+    return x.size, y.size, wavelength.size
+
+
+def save_spectra_output(
+    path: str | Path,
+    *,
+    x_normalized,
+    y_normalized,
+    wavelength_nm,
+    input_stokes,
+    output_stokes,
+) -> dict[str, np.ndarray]:
+    """Write input and fitted Stokes cubes without atmosphere/checkpoint data."""
+
+    payload = {
+        "schema_version": np.asarray(SPECTRA_SCHEMA_VERSION),
+        "stokes_labels": np.asarray(STOKES_LABELS),
+        "x_normalized": np.asarray(x_normalized),
+        "y_normalized": np.asarray(y_normalized),
+        "wavelength_nm": np.asarray(wavelength_nm, dtype=np.float64),
+        "input_stokes": np.asarray(input_stokes),
+        "output_stokes": np.asarray(output_stokes),
+        "intensity_unit": np.asarray("kW m-2 nm-1 sr-1"),
+        "wavelength_unit": np.asarray("nm"),
+    }
+    validate_spectra_output(payload)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **payload)
+    return payload
+
+
+def load_spectra_output(path: str | Path = DEFAULT_SPECTRA_OUTPUT):
+    """Load and validate a compact spectra archive."""
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"spectra output archive does not exist: {path}")
+    with np.load(path, allow_pickle=False) as archive:
+        payload = {key: np.asarray(archive[key]) for key in archive.files}
+    validate_spectra_output(payload)
+    return payload
+
+
 def validate_inversion_result(payload) -> tuple[int, int, int, int]:
     """Validate a self-contained fitted-cube result archive."""
 
@@ -2050,14 +2240,12 @@ def validate_inversion_result(payload) -> tuple[int, int, int, int]:
     _validate_precision_metadata(payload, "inversion_precision")
     required = {
         "synthetic_stokes",
-        "pretrain_loss",
         "inversion_loss_total_spectral_prior",
         "inversion_loss_columns",
         "validation_full_wavelength_loss",
         "best_validation_epoch",
         "best_validation_loss",
         "final_full_cube_spectral_loss",
-        "base_layers",
         "spatial_layers",
         "spatial_scale",
         "stokes_weights",
@@ -2070,16 +2258,23 @@ def validate_inversion_result(payload) -> tuple[int, int, int, int]:
         raise ValueError(
             f"inversion result is missing keys: {', '.join(sorted(missing))}"
         )
+    _validate_correction_metadata(payload)
+    if "inferred_normalized_corrections" not in payload:
+        raise ValueError("inversion result is missing inferred_normalized_corrections")
+    corrections = np.asarray(payload["inferred_normalized_corrections"])
+    if corrections.shape != (nx, ny, n_depth, 8) or not np.all(
+        np.isfinite(corrections) & (np.abs(corrections) <= 1.0)
+    ):
+        raise ValueError(
+            "normalized corrections must be finite (nx, ny, depth, 8) values in [-1, 1]"
+        )
     synthetic = np.asarray(payload["synthetic_stokes"])
     if synthetic.shape != (nx, ny, 4, n_wave) or np.any(~np.isfinite(synthetic)):
         raise ValueError("synthetic_stokes has an invalid shape or values")
     inferred = _atmosphere_from_payload(payload, "inferred_")
     _validate_atmosphere(inferred, expected_shape=(nx, ny, n_depth))
-    pretrain_history = np.asarray(payload["pretrain_loss"])
     inversion_history = np.asarray(payload["inversion_loss_total_spectral_prior"])
     validation_history = np.asarray(payload["validation_full_wavelength_loss"])
-    if pretrain_history.ndim != 1 or np.any(~np.isfinite(pretrain_history)):
-        raise ValueError("pretrain_loss must be a finite one-dimensional history")
     if (
         inversion_history.ndim != 2
         or inversion_history.shape[1] != 3
@@ -2096,6 +2291,45 @@ def validate_inversion_result(payload) -> tuple[int, int, int, int]:
         ~np.isfinite(validation_history)
     ):
         raise ValueError("validation loss history must bracket all inversion epochs")
+    schedule_keys = {
+        "inversion_learning_rate_by_epoch",
+        "inversion_learning_rate_schedule",
+        "inversion_initial_learning_rate",
+        "inversion_final_learning_rate",
+    }
+    present_schedule_keys = schedule_keys.intersection(payload)
+    if present_schedule_keys and present_schedule_keys != schedule_keys:
+        missing_schedule_keys = schedule_keys.difference(payload)
+        raise ValueError(
+            "inversion learning-rate metadata is incomplete: "
+            + ", ".join(sorted(missing_schedule_keys))
+        )
+    if present_schedule_keys:
+        learning_rates = np.asarray(
+            payload["inversion_learning_rate_by_epoch"], dtype=float
+        )
+        initial_learning_rate = float(
+            np.asarray(payload["inversion_initial_learning_rate"])
+        )
+        final_learning_rate = float(
+            np.asarray(payload["inversion_final_learning_rate"])
+        )
+        _validate_learning_rate_range(initial_learning_rate, final_learning_rate)
+        if str(np.asarray(payload["inversion_learning_rate_schedule"])) != (
+            "sin_squared"
+        ):
+            raise ValueError("unsupported inversion learning-rate schedule")
+        if (
+            learning_rates.shape != validation_history.shape
+            or np.any(~np.isfinite(learning_rates))
+            or np.any(np.diff(learning_rates) > initial_learning_rate * 1.0e-6)
+            or not np.isclose(
+                learning_rates[0], initial_learning_rate, rtol=1.0e-6, atol=0.0
+            )
+            or np.any(learning_rates < final_learning_rate * (1.0 - 1.0e-6))
+            or np.any(learning_rates > initial_learning_rate * (1.0 + 1.0e-6))
+        ):
+            raise ValueError("inversion learning-rate history is inconsistent")
     best_epoch = int(np.asarray(payload["best_validation_epoch"]))
     best_loss = float(np.asarray(payload["best_validation_loss"]))
     if best_epoch != int(np.argmin(validation_history)) or not np.isclose(
@@ -2121,6 +2355,7 @@ def generate_test_cube(
     perturbation: PerturbationConfig = PerturbationConfig(),
     show_progress: bool = True,
     wavelength_parallelism: int = DEFAULT_WAVELENGTH_PARALLELISM,
+    spatial_scale=DEFAULT_SPATIAL_SCALE,
 ):
     """Create, perturb, synthesize, and save the requested FAL-C test cube."""
 
@@ -2128,21 +2363,21 @@ def generate_test_cube(
         "wavelength_parallelism", wavelength_parallelism
     )
     perturbation.validate()
-    log_b_min = math.log(magnetic_field_t) + min(0.0, perturbation.log_b)
-    log_b_max = math.log(magnetic_field_t) + max(0.0, perturbation.log_b)
-    if log_b_min <= math.log(_MAGNETIC_FIELD_LOWER) or log_b_max >= math.log(
-        _MAGNETIC_FIELD_UPPER
-    ):
-        raise ValueError(
-            "the reference field plus perturbation exceeds the neural magnetic "
-            "transform bounds"
+    requested = np.asarray(
+        (
+            perturbation.log_temperature / math.log(10.0),
+            perturbation.log_ne / math.log(10.0),
+            perturbation.log_nhtot / math.log(10.0),
+            perturbation.velocity_m_s / _VELOCITY_SCALE,
+            perturbation.log_vturb / math.log(10.0),
+            perturbation.log_b / math.log(10.0),
+            perturbation.inclination_rad / _INCLINATION_SCALE,
+            perturbation.azimuth_rad / _AZIMUTH_SCALE,
         )
-    gamma_min = inclination_rad + min(0.0, perturbation.inclination_rad)
-    gamma_max = inclination_rad + max(0.0, perturbation.inclination_rad)
-    if gamma_min <= _INCLINATION_MARGIN or gamma_max >= math.pi - _INCLINATION_MARGIN:
+    )
+    if np.any(np.abs(requested) >= np.asarray(spatial_scale)):
         raise ValueError(
-            "the reference inclination plus perturbation exceeds the neural "
-            "inclination bounds"
+            "test perturbation exceeds the reference-relative correction bounds"
         )
     lines = read_kurucz(kurucz_path)
     wavelengths = build_wavelength_grid(lines, n_wave, wavelength_padding_nm)
@@ -2162,40 +2397,12 @@ def generate_test_cube(
         inclination_rad,
         azimuth_rad,
     )
-    positive_perturbations = (
-        perturbation.log_temperature,
-        perturbation.log_ne,
-        perturbation.log_nhtot,
-        perturbation.log_vturb,
-    )
-    positive_profiles = (
-        reference.temperature,
-        reference.ne,
-        reference.nhtot,
-        reference.vturb,
-    )
-    for name, profile, amplitude, lower, upper in zip(
-        ("temperature", "ne", "nhtot", "vturb"),
-        positive_profiles,
-        positive_perturbations,
-        _POSITIVE_LOWER_VALUES,
-        _POSITIVE_UPPER_VALUES,
-    ):
-        profile_log = np.log(np.asarray(profile, dtype=np.float64))
-        perturbed_log_min = float(np.min(profile_log)) + min(0.0, amplitude)
-        perturbed_log_max = float(np.max(profile_log)) + max(0.0, amplitude)
-        if perturbed_log_min <= math.log(lower) or perturbed_log_max >= math.log(
-            upper
-        ):
-            raise ValueError(
-                f"the reference {name} plus perturbation exceeds the neural "
-                "transform bounds"
-            )
     truth, envelope = perturb_falc_cube(
         reference_cube, x, y, z_normalized, perturbation
     )
     validate_neural_transform_domain(reference)
     validate_neural_transform_domain(truth)
+    validate_spatial_reachability(reference, truth, spatial_scale)
     observed = synthesize_atmosphere_cube(
         lines,
         wavelengths,
@@ -2229,119 +2436,131 @@ def generate_test_cube(
 
 def _validate_neural_parameters(params, config: NeuralFieldConfig) -> None:
     config.validate()
-    for network_name, layer_sizes in (
-        ("base", config.base_layers),
-        ("spatial", config.spatial_layers),
+    if set(params) != {"reference", "spatial"}:
+        raise ValueError(
+            "parameters must contain a fixed reference and spatial network"
+        )
+    reference = params["reference"]
+    _validate_reference(reference["atmosphere"], reference["height_normalized"])
+    layer_sizes = config.spatial_layers
+    if len(params["spatial"]) != len(layer_sizes) - 1:
+        raise ValueError("spatial parameters do not match the architecture")
+    for index, (layer, n_in, n_out) in enumerate(
+        zip(params["spatial"], layer_sizes[:-1], layer_sizes[1:])
     ):
-        if (
-            network_name not in params
-            or len(params[network_name]) != len(layer_sizes) - 1
+        weight, bias = np.asarray(layer["w"]), np.asarray(layer["b"])
+        if weight.shape != (n_in, n_out) or bias.shape != (n_out,):
+            raise ValueError(f"spatial layer {index} has incompatible shapes")
+        if not np.all(np.isfinite(weight)) or not np.all(np.isfinite(bias)):
+            raise ValueError(f"spatial layer {index} contains non-finite parameters")
+
+
+def _correction_metadata():
+    return {
+        "parameterization": np.asarray(PARAMETERIZATION),
+        "correction_channel_names": np.asarray(CORRECTION_CHANNEL_NAMES),
+        "velocity_offset_scale_m_s": np.asarray(_VELOCITY_SCALE, dtype=np.float64),
+        "inclination_offset_scale_rad": np.asarray(
+            _INCLINATION_SCALE, dtype=np.float64
+        ),
+        "azimuth_offset_scale_rad": np.asarray(_AZIMUTH_SCALE, dtype=np.float64),
+    }
+
+
+def _validate_correction_metadata(payload):
+    for name, expected in _correction_metadata().items():
+        if name not in payload or not np.array_equal(
+            np.asarray(payload[name]), expected
         ):
-            raise ValueError(f"{network_name} parameters do not match the architecture")
-        for index, (layer, n_in, n_out) in enumerate(
-            zip(params[network_name], layer_sizes[:-1], layer_sizes[1:])
-        ):
-            weight = jnp.asarray(layer["w"])
-            bias = jnp.asarray(layer["b"])
-            if weight.shape != (n_in, n_out) or bias.shape != (n_out,):
-                raise ValueError(
-                    f"{network_name} layer {index} has incompatible shapes"
-                )
-            if not bool(jnp.all(jnp.isfinite(weight))) or not bool(
-                jnp.all(jnp.isfinite(bias))
-            ):
-                raise ValueError(
-                    f"{network_name} layer {index} contains non-finite parameters"
-                )
+            raise ValueError(
+                f"{name} does not match the reference-relative parameterization"
+            )
 
 
 def save_checkpoint(path, params, config: NeuralFieldConfig) -> None:
-    """Save a versioned warm-start archive for both MLPs and their transforms."""
+    """Save the spatial MLP, its scales, and the exact fixed reference."""
 
     _validate_neural_parameters(params, config)
     payload = {
         "checkpoint_schema_version": np.asarray(CHECKPOINT_SCHEMA_VERSION),
         "checkpoint_precision": np.asarray(adora_precision.configured_precision()),
-        "base_layers": np.asarray(config.base_layers, dtype=np.int64),
         "spatial_layers": np.asarray(config.spatial_layers, dtype=np.int64),
         "spatial_scale": np.asarray(config.spatial_scale, dtype=np.float64),
-        "latent_channel_names": np.asarray(LATENT_CHANNEL_NAMES),
-        "positive_lower": np.asarray(_POSITIVE_LOWER_VALUES, dtype=np.float64),
-        "positive_upper": np.asarray(_POSITIVE_UPPER_VALUES, dtype=np.float64),
-        "velocity_limit": np.asarray(_VELOCITY_LIMIT, dtype=np.float64),
-        "magnetic_field_lower": np.asarray(
-            _MAGNETIC_FIELD_LOWER, dtype=np.float64
+        "reference_height_normalized": np.asarray(
+            params["reference"]["height_normalized"]
         ),
-        "magnetic_field_upper": np.asarray(
-            _MAGNETIC_FIELD_UPPER, dtype=np.float64
-        ),
-        "inclination_margin": np.asarray(_INCLINATION_MARGIN, dtype=np.float64),
-        "azimuth_limit": np.asarray(_AZIMUTH_LIMIT, dtype=np.float64),
+        **_atmosphere_payload("reference_", params["reference"]["atmosphere"]),
+        **_correction_metadata(),
     }
-    for network_name in ("base", "spatial"):
-        for index, layer in enumerate(params[network_name]):
-            payload[f"{network_name}_{index}_weight"] = np.asarray(layer["w"])
-            payload[f"{network_name}_{index}_bias"] = np.asarray(layer["b"])
+    for index, layer in enumerate(params["spatial"]):
+        payload[f"spatial_{index}_weight"] = np.asarray(layer["w"])
+        payload[f"spatial_{index}_bias"] = np.asarray(layer["b"])
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **payload)
 
 
 def load_checkpoint(path):
-    """Load neural-field parameters and architecture from a saved checkpoint."""
+    """Load a reference-relative model; old learned-base models need a fresh run."""
 
     with np.load(Path(path), allow_pickle=False) as archive:
         if (
             int(np.asarray(archive["checkpoint_schema_version"]))
             != CHECKPOINT_SCHEMA_VERSION
         ):
-            raise ValueError("unsupported checkpoint schema version")
-        expected_transform = {
-            "positive_lower": np.asarray(_POSITIVE_LOWER_VALUES, dtype=np.float64),
-            "positive_upper": np.asarray(_POSITIVE_UPPER_VALUES, dtype=np.float64),
-            "velocity_limit": np.asarray(_VELOCITY_LIMIT, dtype=np.float64),
-            "magnetic_field_lower": np.asarray(
-                _MAGNETIC_FIELD_LOWER, dtype=np.float64
-            ),
-            "magnetic_field_upper": np.asarray(
-                _MAGNETIC_FIELD_UPPER, dtype=np.float64
-            ),
-            "inclination_margin": np.asarray(
-                _INCLINATION_MARGIN, dtype=np.float64
-            ),
-            "azimuth_limit": np.asarray(_AZIMUTH_LIMIT, dtype=np.float64),
-        }
-        if "checkpoint_precision" in archive.files:
-            _validate_precision_metadata(archive, "checkpoint_precision")
-        if tuple(str(value) for value in archive["latent_channel_names"]) != (
-            LATENT_CHANNEL_NAMES
-        ):
-            raise ValueError("checkpoint latent-channel semantics do not match")
-        for name, expected in expected_transform.items():
-            if not np.array_equal(np.asarray(archive[name]), expected):
-                raise ValueError(f"checkpoint {name} transform does not match")
-        base_layers = tuple(int(value) for value in archive["base_layers"])
-        spatial_layers = tuple(int(value) for value in archive["spatial_layers"])
+            raise ValueError(
+                "unsupported checkpoint schema version: learned-base checkpoints "
+                "cannot be used by the fixed-reference log10 model; start without "
+                "--checkpoint-in or regenerate the initial checkpoint"
+            )
+        _validate_correction_metadata(archive)
+        _validate_precision_metadata(archive, "checkpoint_precision")
+        layers = tuple(int(value) for value in archive["spatial_layers"])
         config = NeuralFieldConfig(
-            base_hidden=base_layers[1:-1],
-            spatial_hidden=spatial_layers[1:-1],
-            base_frequencies=(base_layers[0] - 1) // 2,
+            spatial_hidden=layers[1:-1],
             spatial_scale=tuple(float(value) for value in archive["spatial_scale"]),
         )
-        params = {}
-        for network_name, layers in (
-            ("base", base_layers),
-            ("spatial", spatial_layers),
-        ):
-            params[network_name] = tuple(
+        if layers != config.spatial_layers:
+            raise ValueError(
+                "checkpoint spatial architecture must have 3 inputs and 8 outputs"
+            )
+        params = {
+            "reference": {
+                "height_normalized": _as_real(archive["reference_height_normalized"]),
+                "atmosphere": _atmosphere_from_payload(archive, "reference_"),
+            },
+            "spatial": tuple(
                 {
-                    "w": _as_real(archive[f"{network_name}_{index}_weight"]),
-                    "b": _as_real(archive[f"{network_name}_{index}_bias"]),
+                    "w": _as_real(archive[f"spatial_{index}_weight"]),
+                    "b": _as_real(archive[f"spatial_{index}_bias"]),
                 }
                 for index in range(len(layers) - 1)
-            )
+            ),
+        }
     _validate_neural_parameters(params, config)
     return params, config
+
+
+def _validate_checkpoint_reference(params, reference, height_normalized):
+    stored = params["reference"]
+    for name, actual, expected in zip(
+        ("height_normalized", *FIELD_NAMES),
+        (stored["height_normalized"], *stored["atmosphere"]),
+        (height_normalized, *reference),
+    ):
+        actual, expected = np.asarray(actual), np.asarray(expected)
+        tolerance = max(
+            8.0 * np.finfo(actual.dtype).eps,
+            8.0 * np.finfo(expected.dtype).eps,
+            1.0e-12,
+        )
+        if actual.shape != expected.shape or not np.allclose(
+            actual,
+            expected,
+            rtol=tolerance,
+            atol=tolerance if name == "height_normalized" else 0.0,
+        ):
+            raise ValueError(f"checkpoint reference {name} does not match the dataset")
 
 
 def _coordinate_cube_from_payload(payload):
@@ -2352,6 +2571,169 @@ def _coordinate_cube_from_payload(payload):
     return 2.0 * jnp.stack((xx, yy, zz), axis=-1) - 1.0
 
 
+def _display_atmosphere_quantities(atmosphere: Atmosphere) -> tuple[np.ndarray, ...]:
+    """Convert an atmosphere cube into T, log10(ne), Bx, and Bz display maps."""
+
+    temperature = np.asarray(atmosphere.temperature, dtype=float)
+    log_ne = np.log10(np.asarray(atmosphere.ne, dtype=float))
+    strength_g = 1.0e4 * np.asarray(atmosphere.b, dtype=float)
+    inclination = np.asarray(atmosphere.gamma_b, dtype=float)
+    azimuth = np.asarray(atmosphere.chi_b, dtype=float)
+    bx = strength_g * np.sin(inclination) * np.cos(azimuth)
+    bz = strength_g * np.cos(inclination)
+    return temperature, log_ne, bx, bz
+
+
+def create_inversion_evaluation_figure(
+    wavelength_nm,
+    input_stokes,
+    output_stokes,
+    x_normalized,
+    y_normalized,
+    height_m,
+    input_atmosphere: Atmosphere,
+    output_atmosphere: Atmosphere,
+    *,
+    x_index: int,
+    y_index: int,
+    height_index: int,
+    epoch: int | None = None,
+):
+    """Create the 4x3 linked-view layout as a non-interactive snapshot.
+
+    This lightweight renderer is used for periodic W&B evaluations. The
+    interactive GUI in :mod:`compare_inversion_gui` uses the same quantities
+    and panel ordering.
+    """
+
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    wavelength_nm = np.asarray(wavelength_nm, dtype=float)
+    input_stokes = np.asarray(input_stokes, dtype=float)
+    output_stokes = np.asarray(output_stokes, dtype=float)
+    x_normalized = np.asarray(x_normalized, dtype=float)
+    y_normalized = np.asarray(y_normalized, dtype=float)
+    height_m = np.asarray(height_m, dtype=float)
+    if input_stokes.shape != output_stokes.shape or input_stokes.shape != (
+        4,
+        wavelength_nm.size,
+    ):
+        raise ValueError("evaluation Stokes profiles must have shape (4, n_wave)")
+    if not (0 <= x_index < x_normalized.size and 0 <= y_index < y_normalized.size):
+        raise IndexError("evaluation horizontal index is outside the FOV")
+    if not 0 <= height_index < height_m.size:
+        raise IndexError("evaluation height index is outside the atmosphere")
+
+    input_quantities = _display_atmosphere_quantities(input_atmosphere)
+    output_quantities = _display_atmosphere_quantities(output_atmosphere)
+    expected_shape = (x_normalized.size, y_normalized.size, height_m.size)
+    all_quantities = (*input_quantities, *output_quantities)
+    if any(values.shape != expected_shape for values in all_quantities):
+        raise ValueError(
+            f"evaluation atmosphere fields must have shape {expected_shape}"
+        )
+
+    figure, axes = plt.subplots(4, 3, figsize=(14.5, 12.0), constrained_layout=True)
+    labels = (r"$I/I_c$", r"$Q/I_c$", r"$U/I_c$", r"$V/I_c$")
+    quantity_titles = (
+        "Temperature [K]",
+        r"$\log_{10}(n_e\,[\mathrm{m}^{-3}])$",
+        r"$B_x$ [G]",
+        r"$B_z$ [G]",
+    )
+    cmaps = ("inferno", "viridis", "RdBu_r", "RdBu_r")
+    continuum = max(
+        abs(0.5 * (input_stokes[0, 0] + input_stokes[0, -1])),
+        np.finfo(float).tiny,
+    )
+    for row, label in enumerate(labels):
+        spectrum_axis = axes[row, 0]
+        spectrum_axis.plot(
+            wavelength_nm,
+            input_stokes[row] / continuum,
+            color="black",
+            linewidth=1.5,
+            label="Input",
+        )
+        spectrum_axis.plot(
+            wavelength_nm,
+            output_stokes[row] / continuum,
+            color="tab:orange",
+            linewidth=1.25,
+            linestyle="--",
+            label="Current inversion",
+        )
+        spectrum_axis.set_ylabel(label)
+        spectrum_axis.grid(alpha=0.22)
+        if row == 0:
+            spectrum_axis.legend(loc="best", fontsize="small")
+        if row == 3:
+            spectrum_axis.set_xlabel("Wavelength [nm]")
+
+        truth_slice = input_quantities[row][:, :, height_index]
+        lower, upper = np.percentile(truth_slice, (5.0, 95.0))
+        if not upper > lower:
+            padding = max(abs(float(lower)) * 0.01, 1.0e-12)
+            lower, upper = lower - padding, upper + padding
+        normalization = Normalize(vmin=float(lower), vmax=float(upper))
+        x_extent = (
+            (float(x_normalized[0] - 0.5), float(x_normalized[0] + 0.5))
+            if x_normalized.size == 1
+            else (float(x_normalized[0]), float(x_normalized[-1]))
+        )
+        y_extent = (
+            (float(y_normalized[0] - 0.5), float(y_normalized[0] + 0.5))
+            if y_normalized.size == 1
+            else (float(y_normalized[0]), float(y_normalized[-1]))
+        )
+        extent = (*x_extent, *y_extent)
+        row_images = []
+        row_quantities = (input_quantities[row], output_quantities[row])
+        for column, values in enumerate(row_quantities, 1):
+            map_axis = axes[row, column]
+            image = map_axis.imshow(
+                values[:, :, height_index].T,
+                origin="lower",
+                extent=extent,
+                aspect="equal",
+                interpolation="nearest",
+                cmap=cmaps[row],
+                norm=normalization,
+            )
+            row_images.append(image)
+            map_axis.plot(
+                x_normalized[x_index],
+                y_normalized[y_index],
+                marker="+",
+                color="white",
+                markeredgewidth=1.5,
+                markersize=9,
+            )
+            if row == 0:
+                map_axis.set_title(
+                    "Input / truth" if column == 1 else "Current inversion"
+                )
+            if row == 3:
+                map_axis.set_xlabel("x (normalized)")
+            if column == 1:
+                map_axis.set_ylabel(f"{quantity_titles[row]}\ny (normalized)")
+        figure.colorbar(
+            row_images[-1],
+            ax=axes[row, 1:].tolist(),
+            shrink=0.72,
+            pad=0.02,
+        )
+
+    location = (
+        f"x={x_normalized[x_index]:.3f}, y={y_normalized[y_index]:.3f}; "
+        f"z={height_m[height_index] / 1000.0:.1f} km"
+    )
+    prefix = "Evaluation" if epoch is None else f"Evaluation at epoch {epoch}"
+    figure.suptitle(f"{prefix} — {location}", fontweight="bold")
+    return figure
+
+
 def run_inversion(
     payload,
     kurucz_path=FE_I_6301_6302_LINE_LIST,
@@ -2359,31 +2741,67 @@ def run_inversion(
     checkpoint_path=DEFAULT_CHECKPOINT,
     field_config: NeuralFieldConfig = NeuralFieldConfig(),
     initial_params=None,
-    pretrain_steps: int = 2000,
-    pretrain_learning_rate: float = 2.0e-3,
-    pretrain_tolerance: float | None = 1.0e-4,
     inversion_epochs: int = 10,
-    inversion_learning_rate: float = 3.0e-4,
+    inversion_learning_rate: float = DEFAULT_INVERSION_INITIAL_LEARNING_RATE,
+    inversion_final_learning_rate: float = DEFAULT_INVERSION_FINAL_LEARNING_RATE,
     training_batch_columns: int = 8,
     wavelength_batch: int = 48,
     synthesis_batch_columns: int = 16,
     stokes_weights=(1.0, 5.0, 5.0, 2.0),
     prior_weight: float = 1.0e-5,
-    fine_tune_base: bool = False,
     seed: int = 0,
     show_progress: bool = True,
     wavelength_parallelism: int = DEFAULT_WAVELENGTH_PARALLELISM,
     validation_columns: int = DEFAULT_VALIDATION_COLUMNS,
+    experiment_logger: WandbRunLogger | None = None,
+    spectra_output_path: str | Path | None = None,
 ):
-    """Pretrain and spectrally invert an already generated test cube."""
+    """Invert spectra with bounded corrections to an exact fixed reference."""
 
+    inversion_run_started = time.perf_counter()
     wavelength_parallelism = _validate_positive_integer(
         "wavelength_parallelism", wavelength_parallelism
     )
     validation_columns = _validate_positive_integer(
         "validation_columns", validation_columns
     )
-    nx, ny, n_depth, _ = validate_test_cube(payload)
+    _validate_learning_rate_range(
+        inversion_learning_rate, inversion_final_learning_rate
+    )
+    if spectra_output_path is not None:
+        spectra_path = Path(spectra_output_path).resolve()
+        protected_paths = {
+            Path(result_path).resolve(): "result",
+            Path(checkpoint_path).resolve(): "checkpoint",
+        }
+        if spectra_path in protected_paths:
+            raise ValueError(
+                "spectra_output_path must differ from the "
+                f"{protected_paths[spectra_path]} path"
+            )
+    nx, ny, n_depth, n_wave = validate_test_cube(payload)
+    if experiment_logger is not None:
+        experiment_logger.update_config(
+            {
+                "dataset_nx": nx,
+                "dataset_ny": ny,
+                "dataset_n_depth": n_depth,
+                "dataset_n_wave": n_wave,
+                "dataset_n_columns": nx * ny,
+                "inversion_learning_rate_schedule": "sin_squared",
+                "inversion_initial_learning_rate": inversion_learning_rate,
+                "inversion_final_learning_rate": inversion_final_learning_rate,
+            }
+        )
+        experiment_logger.update_summary(
+            {
+                "outputs/result_path": Path(result_path),
+                "outputs/checkpoint_path": Path(checkpoint_path),
+                "outputs/spectra_path": (
+                    None if spectra_output_path is None else Path(spectra_output_path)
+                ),
+            }
+        )
     field_config.validate()
     lines = read_kurucz(kurucz_path)
     saved_centers = np.asarray(payload["line_center_nm"], dtype=np.float64)
@@ -2396,10 +2814,9 @@ def run_inversion(
         raise ValueError("the inversion atomic data do not match the test cube")
     reference = _atmosphere_from_payload(payload, "reference_")
     truth = _atmosphere_from_payload(payload, "truth_")
-    if not fine_tune_base:
-        validate_spatial_reachability(
-            reference, truth, _as_real(field_config.spatial_scale)
-        )
+    validate_spatial_reachability(
+        reference, truth, _as_real(field_config.spatial_scale)
+    )
     coordinates = _coordinate_cube_from_payload(payload)
     flat_coordinates = coordinates.reshape((nx * ny, n_depth, 3))
     observed = _as_real(payload["observed_stokes"]).reshape((nx * ny, 4, -1))
@@ -2407,26 +2824,80 @@ def run_inversion(
     # precenters them.  Casting this array here would lose fp32 line resolution.
     wavelengths = _host_wavelength_axis(payload["wavelength_nm"])
     dz = _as_real(payload["cell_width_m"])
-    if pretrain_steps == 0 and initial_params is None:
-        raise ValueError("zero pretraining steps require warm-start parameters")
     if initial_params is None:
-        params = initialize_neural_field(jax.random.PRNGKey(seed), field_config)
+        params = initialize_neural_field(
+            jax.random.PRNGKey(seed),
+            reference,
+            payload["height_normalized"],
+            field_config,
+        )
     else:
         _validate_neural_parameters(initial_params, field_config)
+        _validate_checkpoint_reference(
+            initial_params, reference, payload["height_normalized"]
+        )
         params = jax.tree.map(_as_real, initial_params)
-    params, pretrain_history = pretrain_falc(
-        params,
-        payload["height_normalized"],
-        reference,
-        steps=pretrain_steps,
-        learning_rate=pretrain_learning_rate,
-        tolerance=pretrain_tolerance,
-        show_progress=show_progress,
-    )
-    # Persist the expensive pretrained state before entering the long spectral
-    # loop.  This archive is a warm start (Adam/RNG state is intentionally not
-    # claimed to be an exact interrupted-run resume).
+    # Save the exact-reference initialization (or compatible warm start).
     save_checkpoint(checkpoint_path, params, field_config)
+    spectral_inversion_started = time.perf_counter()
+
+    evaluation_callback = None
+    if experiment_logger is not None:
+        evaluation_x_index = nx // 2
+        evaluation_y_index = ny // 2
+        evaluation_height_index = n_depth // 2
+
+        def evaluation_callback(epoch, current_params):
+            current_atmosphere = evaluate_neural_field_cube(
+                current_params,
+                coordinates,
+                _as_real(field_config.spatial_scale),
+                batch_columns=synthesis_batch_columns,
+                show_progress=False,
+            )
+            current_column = Atmosphere(
+                *(
+                    field[
+                        evaluation_x_index : evaluation_x_index + 1,
+                        evaluation_y_index : evaluation_y_index + 1,
+                        :,
+                    ]
+                    for field in current_atmosphere
+                )
+            )
+            current_stokes = synthesize_atmosphere_cube(
+                lines,
+                wavelengths,
+                dz,
+                current_column,
+                batch_columns=1,
+                show_progress=False,
+                description="Synthesizing W&B evaluation spectrum",
+                wavelength_parallelism=wavelength_parallelism,
+            )
+            figure = create_inversion_evaluation_figure(
+                wavelengths,
+                np.asarray(payload["observed_stokes"])[
+                    evaluation_x_index, evaluation_y_index
+                ],
+                np.asarray(current_stokes)[0, 0],
+                payload["x_normalized"],
+                payload["y_normalized"],
+                payload["height_m"],
+                truth,
+                current_atmosphere,
+                x_index=evaluation_x_index,
+                y_index=evaluation_y_index,
+                height_index=evaluation_height_index,
+                epoch=epoch,
+            )
+            try:
+                experiment_logger.log_evaluation_figure(epoch, figure)
+            finally:
+                import matplotlib.pyplot as plt
+
+                plt.close(figure)
+
     params, inversion_history, validation_history = train_spectral_inversion(
         params,
         flat_coordinates,
@@ -2439,26 +2910,46 @@ def run_inversion(
         batch_columns=training_batch_columns,
         wavelength_batch=wavelength_batch,
         learning_rate=inversion_learning_rate,
+        final_learning_rate=inversion_final_learning_rate,
         stokes_weights=stokes_weights,
         spatial_scale=_as_real(field_config.spatial_scale),
         prior_weight=prior_weight,
-        fine_tune_base=fine_tune_base,
         seed=seed + 1,
         show_progress=show_progress,
         wavelength_parallelism=wavelength_parallelism,
         validation_columns=validation_columns,
+        metrics_callback=(
+            None
+            if experiment_logger is None
+            else experiment_logger.log_inversion_metrics
+        ),
+        evaluation_callback=evaluation_callback,
+        evaluation_every=(
+            DEFAULT_WANDB_EVALUATION_EVERY
+            if experiment_logger is None
+            else experiment_logger.evaluation_every
+        ),
     )
+    spectral_inversion_seconds = time.perf_counter() - spectral_inversion_started
+    if experiment_logger is not None:
+        experiment_logger.update_summary(
+            {"timing/spectral_inversion_seconds": spectral_inversion_seconds}
+        )
     # Preserve the best fitted iterate before any expensive full-cube rendering
     # or archive compression can fail.
     save_checkpoint(checkpoint_path, params, field_config)
-    inferred = evaluate_neural_field_cube(
+    atmosphere_evaluation_started = time.perf_counter()
+    inferred, normalized_corrections = evaluate_neural_field_cube(
         params,
         coordinates,
         _as_real(field_config.spatial_scale),
         batch_columns=synthesis_batch_columns,
         show_progress=show_progress,
+        return_corrections=True,
     )
     _validate_atmosphere(inferred, expected_shape=(nx, ny, n_depth))
+    atmosphere_evaluation_seconds = time.perf_counter() - atmosphere_evaluation_started
+    final_synthesis_started = time.perf_counter()
     final_stokes = synthesize_atmosphere_cube(
         lines,
         wavelengths,
@@ -2469,29 +2960,59 @@ def run_inversion(
         description="Synthesizing fitted cube",
         wavelength_parallelism=wavelength_parallelism,
     )
-    observed_array = np.asarray(payload["observed_stokes"])
     synthetic_array = np.asarray(final_stokes)
+    final_synthesis_seconds = time.perf_counter() - final_synthesis_started
+    observed_array = np.asarray(payload["observed_stokes"])
     continuum = 0.5 * (observed_array[:, :, 0, 0] + observed_array[:, :, 0, -1])
     continuum = np.maximum(np.abs(continuum), np.finfo(NUMPY_REAL_DTYPE).tiny)
     residual = (synthetic_array - observed_array) / continuum[:, :, None, None]
     final_full_loss = np.mean(
         (residual * np.asarray(stokes_weights)[None, None, :, None]) ** 2
     )
+    updates_per_epoch = math.ceil((nx * ny) / training_batch_columns)
+    total_optimizer_steps = inversion_epochs * updates_per_epoch
+    learning_rate_schedule = sin_squared_learning_rate_schedule(
+        total_optimizer_steps,
+        inversion_learning_rate,
+        inversion_final_learning_rate,
+    )
+    learning_rate_history = np.asarray(
+        [
+            float(
+                np.asarray(
+                    learning_rate_schedule(
+                        0
+                        if epoch == 0
+                        else min(
+                            epoch * updates_per_epoch - 1,
+                            max(total_optimizer_steps - 1, 0),
+                        )
+                    )
+                )
+            )
+            for epoch in range(inversion_epochs + 1)
+        ]
+    )
     result = {
         **{key: np.asarray(value) for key, value in payload.items()},
-        "synthetic_stokes": np.asarray(final_stokes),
-        "pretrain_loss": pretrain_history,
+        "synthetic_stokes": synthetic_array,
+        "inferred_normalized_corrections": normalized_corrections,
+        **_correction_metadata(),
         "inversion_loss_total_spectral_prior": inversion_history,
         "inversion_loss_columns": np.asarray(("total", "spectral", "prior")),
         "validation_full_wavelength_loss": validation_history,
+        "inversion_learning_rate_by_epoch": learning_rate_history,
+        "inversion_learning_rate_schedule": np.asarray("sin_squared"),
+        "inversion_initial_learning_rate": np.asarray(inversion_learning_rate),
+        "inversion_final_learning_rate": np.asarray(inversion_final_learning_rate),
         "best_validation_epoch": np.asarray(int(np.argmin(validation_history))),
         "best_validation_loss": np.asarray(np.min(validation_history)),
         "final_full_cube_spectral_loss": np.asarray(final_full_loss),
-        "base_layers": np.asarray(field_config.base_layers, dtype=np.int64),
         "spatial_layers": np.asarray(field_config.spatial_layers, dtype=np.int64),
         "spatial_scale": np.asarray(field_config.spatial_scale),
         "stokes_weights": np.asarray(stokes_weights),
         "prior_weight": np.asarray(prior_weight),
+        "training_batch_columns": np.asarray(training_batch_columns),
         "wavelength_parallelism": np.asarray(wavelength_parallelism),
         "validation_columns": np.asarray(validation_columns),
         "inversion_precision": np.asarray(adora_precision.configured_precision()),
@@ -2500,9 +3021,37 @@ def run_inversion(
     }
     validate_inversion_result(result)
     result_path = Path(result_path)
+    result_save_started = time.perf_counter()
     result_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(result_path, **result)
+    result_save_seconds = time.perf_counter() - result_save_started
+    spectra_save_started = time.perf_counter()
+    if spectra_output_path is not None:
+        save_spectra_output(
+            spectra_output_path,
+            x_normalized=payload["x_normalized"],
+            y_normalized=payload["y_normalized"],
+            wavelength_nm=wavelengths,
+            input_stokes=observed_array,
+            output_stokes=synthetic_array,
+        )
+    spectra_save_seconds = time.perf_counter() - spectra_save_started
     save_checkpoint(checkpoint_path, params, field_config)
+    if experiment_logger is not None:
+        experiment_logger.update_summary(
+            {
+                "inversion/best_validation_epoch": int(np.argmin(validation_history)),
+                "inversion/best_validation_loss": float(np.min(validation_history)),
+                "inversion/final_full_cube_spectral_loss": float(final_full_loss),
+                "timing/atmosphere_evaluation_seconds": (atmosphere_evaluation_seconds),
+                "timing/final_synthesis_seconds": final_synthesis_seconds,
+                "timing/result_save_seconds": result_save_seconds,
+                "timing/spectra_save_seconds": spectra_save_seconds,
+                "timing/run_inversion_seconds": (
+                    time.perf_counter() - inversion_run_started
+                ),
+            }
+        )
     return params, result
 
 
@@ -2518,6 +3067,17 @@ def _parse_hidden_layers(value: str) -> tuple[int, ...]:
     return layers
 
 
+def _parse_spatial_scale(value: str) -> tuple[float, ...]:
+    try:
+        scales = tuple(float(piece.strip()) for piece in value.split(","))
+        NeuralFieldConfig(spatial_scale=scales).validate()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "spatial scale needs eight positive finite values"
+        ) from exc
+    return scales
+
+
 def _parse_stokes_weights(value: str) -> tuple[float, float, float, float]:
     try:
         weights = tuple(float(item.strip()) for item in value.split(","))
@@ -2530,6 +3090,13 @@ def _parse_stokes_weights(value: str) -> tuple[float, float, float, float]:
             "Stokes weights must be four positive comma-separated values"
         )
     return weights
+
+
+def _parse_wandb_tags(value: str) -> tuple[str, ...]:
+    tags = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not tags:
+        raise argparse.ArgumentTypeError("W&B tags must not be empty")
+    return tags
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -2556,11 +3123,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--invert-only",
         action="store_true",
-        help="load --dataset and run pretraining/inversion without regeneration",
+        help="load --dataset and invert without regeneration",
     )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--result", type=Path, default=DEFAULT_RESULT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--spectra-output",
+        "--output-spectra",
+        type=Path,
+        nargs="?",
+        const=DEFAULT_SPECTRA_OUTPUT,
+        metavar="PATH",
+        help=(
+            "optionally write a compact NPZ containing wavelength plus input "
+            "and fitted Stokes cubes; without PATH, use "
+            f"{DEFAULT_SPECTRA_OUTPUT}"
+        ),
+    )
     parser.add_argument(
         "--checkpoint-in",
         type=Path,
@@ -2575,22 +3155,30 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inclination-rad", type=float, default=0.8)
     parser.add_argument("--azimuth-rad", type=float, default=0.3)
     parser.add_argument(
-        "--base-hidden", type=_parse_hidden_layers, default=(128, 128, 128)
-    )
-    parser.add_argument(
         "--spatial-hidden", type=_parse_hidden_layers, default=(96, 96, 96)
     )
-    parser.add_argument("--base-frequencies", type=int, default=6)
-    parser.add_argument("--pretrain-steps", type=int, default=2000)
-    parser.add_argument("--pretrain-learning-rate", type=float, default=2.0e-3)
-    parser.add_argument("--pretrain-tolerance", type=float, default=1.0e-4)
     parser.add_argument(
-        "--skip-pretraining",
-        action="store_true",
-        help="use --checkpoint-in directly and skip additional FAL-C pretraining",
+        "--spatial-scale",
+        type=_parse_spatial_scale,
+        default=_SPATIAL_SCALE_VALUES,
+        metavar="T,NE,NH,V,VT,B,GAMMA,CHI",
+        help="positive scales for bounded outputs: dex for T/NE/NH/VT/B; units of 20 km/s, pi, pi/2 for V/GAMMA/CHI (default: all 1)",
     )
+
     parser.add_argument("--inversion-epochs", type=int, default=10)
-    parser.add_argument("--inversion-learning-rate", type=float, default=3.0e-4)
+    parser.add_argument(
+        "--inversion-learning-rate",
+        "--inversion-initial-learning-rate",
+        type=float,
+        default=DEFAULT_INVERSION_INITIAL_LEARNING_RATE,
+        help="initial sin-squared schedule rate (default: 1e-3)",
+    )
+    parser.add_argument(
+        "--inversion-final-learning-rate",
+        type=float,
+        default=DEFAULT_INVERSION_FINAL_LEARNING_RATE,
+        help="final sin-squared schedule rate (default: 1e-5)",
+    )
     parser.add_argument("--training-batch-columns", type=int, default=8)
     parser.add_argument(
         "--validation-columns",
@@ -2617,9 +3205,61 @@ def build_argument_parser() -> argparse.ArgumentParser:
         metavar="I,Q,U,V",
     )
     parser.add_argument("--prior-weight", type=float, default=1.0e-5)
-    parser.add_argument("--fine-tune-base", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-progress", action="store_true")
+    wandb_group = parser.add_argument_group("Weights & Biases")
+    wandb_group.add_argument(
+        "--wandb",
+        action="store_true",
+        help="enable optional Weights & Biases experiment logging",
+    )
+    wandb_group.add_argument(
+        "--wandb-login",
+        action="store_true",
+        help="run wandb.login() interactively before starting an online run",
+    )
+    wandb_group.add_argument(
+        "--wandb-project",
+        default=DEFAULT_WANDB_PROJECT,
+        help=f"W&B project name (default: {DEFAULT_WANDB_PROJECT})",
+    )
+    wandb_group.add_argument("--wandb-entity", help="W&B user or team")
+    wandb_group.add_argument("--wandb-name", help="W&B run display name")
+    wandb_group.add_argument("--wandb-group", help="optional W&B run group")
+    wandb_group.add_argument(
+        "--wandb-tags",
+        type=_parse_wandb_tags,
+        default=(),
+        metavar="TAG[,TAG...]",
+        help="comma-separated W&B tags",
+    )
+    wandb_group.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+        help="W&B synchronization mode (default: online)",
+    )
+    wandb_group.add_argument(
+        "--wandb-dir",
+        type=Path,
+        help="directory for local W&B metadata (default: ./wandb)",
+    )
+
+    wandb_group.add_argument(
+        "--wandb-evaluation-every",
+        type=int,
+        default=DEFAULT_WANDB_EVALUATION_EVERY,
+        metavar="EPOCHS",
+        help=(
+            "plot current spectra and atmosphere maps every N inversion epochs "
+            "(default: 50; epoch zero and the final epoch are also logged)"
+        ),
+    )
+    wandb_group.add_argument(
+        "--wandb-log-artifacts",
+        action="store_true",
+        help="upload dataset, result, and checkpoint NPZ files as W&B Artifacts",
+    )
     return parser
 
 
@@ -2627,6 +3267,24 @@ def main(argv=None):
     """Run generation, inversion, or the complete requested workflow."""
 
     args = build_argument_parser().parse_args(argv)
+    if args.wandb_login and not args.wandb:
+        raise ValueError("--wandb-login requires --wandb")
+    if args.wandb_login and args.wandb_mode != "online":
+        raise ValueError("--wandb-login requires --wandb-mode online")
+    if args.generate_only and args.spectra_output is not None:
+        raise ValueError("--spectra-output requires an inversion run")
+    if args.spectra_output is not None:
+        spectra_path = args.spectra_output.resolve()
+        protected_paths = {
+            args.dataset.resolve(): "dataset",
+            args.result.resolve(): "result",
+            args.checkpoint.resolve(): "checkpoint",
+        }
+        if spectra_path in protected_paths:
+            raise ValueError(
+                "--spectra-output must differ from the "
+                f"--{protected_paths[spectra_path]} path"
+            )
     active_precision = adora_precision.configured_precision()
     if args.precision != active_precision:
         raise ValueError(
@@ -2638,60 +3296,131 @@ def main(argv=None):
     show_progress = not args.no_progress
     initial_params = None
     config = NeuralFieldConfig(
-        base_hidden=args.base_hidden,
         spatial_hidden=args.spatial_hidden,
-        base_frequencies=args.base_frequencies,
+        spatial_scale=args.spatial_scale,
     )
     config.validate()
     if not args.generate_only:
-        if args.skip_pretraining and args.checkpoint_in is None:
-            raise ValueError("--skip-pretraining requires --checkpoint-in")
         if args.checkpoint_in is not None:
             # Load before generation so a missing/corrupt warm start cannot
             # waste the expensive default truth-cube synthesis.
             initial_params, config = load_checkpoint(args.checkpoint_in)
-    if args.invert_only:
-        payload = load_test_cube(args.dataset)
+    experiment_logger = _initialize_wandb(args, config) if args.wandb else None
+    workflow_started = time.perf_counter()
+    try:
+        if experiment_logger is not None and args.checkpoint_in is not None:
+            experiment_logger.track_file(
+                args.checkpoint_in,
+                artifact_type="model",
+                role="input",
+            )
+
+        dataset_started = time.perf_counter()
+        if args.invert_only:
+            payload = load_test_cube(args.dataset)
+            dataset_timing_name = "timing/dataset_load_seconds"
+            dataset_artifact_role = "input"
+        else:
+            payload = generate_test_cube(
+                output_path=args.dataset,
+                kurucz_path=args.kurucz,
+                nx=args.nx,
+                ny=args.ny,
+                n_wave=args.n_wave,
+                wavelength_padding_nm=args.wavelength_padding_nm,
+                synthesis_batch_columns=args.synthesis_batch_columns,
+                magnetic_field_t=args.magnetic_field_t,
+                inclination_rad=args.inclination_rad,
+                azimuth_rad=args.azimuth_rad,
+                show_progress=show_progress,
+                spatial_scale=config.spatial_scale,
+                wavelength_parallelism=args.wavelength_parallelism,
+            )
+            dataset_timing_name = "timing/generation_seconds"
+            dataset_artifact_role = "output"
+
+        if experiment_logger is not None:
+            nx, ny, n_depth, n_wave = validate_test_cube(payload)
+            if args.generate_only:
+                experiment_logger.update_config(
+                    {
+                        "dataset_nx": nx,
+                        "dataset_ny": ny,
+                        "dataset_n_depth": n_depth,
+                        "dataset_n_wave": n_wave,
+                        "dataset_n_columns": nx * ny,
+                    }
+                )
+            experiment_logger.update_summary(
+                {
+                    dataset_timing_name: time.perf_counter() - dataset_started,
+                    "outputs/dataset_path": args.dataset,
+                }
+            )
+            experiment_logger.track_file(
+                args.dataset,
+                artifact_type="dataset",
+                role=dataset_artifact_role,
+            )
+
+        if not args.generate_only:
+            run_inversion(
+                payload,
+                kurucz_path=args.kurucz,
+                result_path=args.result,
+                checkpoint_path=args.checkpoint,
+                field_config=config,
+                initial_params=initial_params,
+                inversion_epochs=args.inversion_epochs,
+                inversion_learning_rate=args.inversion_learning_rate,
+                inversion_final_learning_rate=args.inversion_final_learning_rate,
+                training_batch_columns=args.training_batch_columns,
+                wavelength_batch=args.wavelength_batch,
+                synthesis_batch_columns=args.synthesis_batch_columns,
+                stokes_weights=args.stokes_weights,
+                prior_weight=args.prior_weight,
+                seed=args.seed,
+                show_progress=show_progress,
+                wavelength_parallelism=args.wavelength_parallelism,
+                validation_columns=args.validation_columns,
+                experiment_logger=experiment_logger,
+                spectra_output_path=args.spectra_output,
+            )
+            if experiment_logger is not None:
+                experiment_logger.track_file(
+                    args.checkpoint,
+                    artifact_type="model",
+                    role="output",
+                )
+                experiment_logger.track_file(
+                    args.result,
+                    artifact_type="inversion-result",
+                    role="output",
+                )
+                if args.spectra_output is not None:
+                    experiment_logger.track_file(
+                        args.spectra_output,
+                        artifact_type="spectra",
+                        role="output",
+                    )
+        if experiment_logger is not None:
+            experiment_logger.update_summary(
+                {
+                    "timing/total_workflow_seconds": (
+                        time.perf_counter() - workflow_started
+                    )
+                }
+            )
+    except BaseException:
+        if experiment_logger is not None:
+            try:
+                experiment_logger.finish(exit_code=1)
+            except Exception:
+                pass
+        raise
     else:
-        payload = generate_test_cube(
-            output_path=args.dataset,
-            kurucz_path=args.kurucz,
-            nx=args.nx,
-            ny=args.ny,
-            n_wave=args.n_wave,
-            wavelength_padding_nm=args.wavelength_padding_nm,
-            synthesis_batch_columns=args.synthesis_batch_columns,
-            magnetic_field_t=args.magnetic_field_t,
-            inclination_rad=args.inclination_rad,
-            azimuth_rad=args.azimuth_rad,
-            show_progress=show_progress,
-            wavelength_parallelism=args.wavelength_parallelism,
-        )
-    if args.generate_only:
-        return None
-    run_inversion(
-        payload,
-        kurucz_path=args.kurucz,
-        result_path=args.result,
-        checkpoint_path=args.checkpoint,
-        field_config=config,
-        initial_params=initial_params,
-        pretrain_steps=0 if args.skip_pretraining else args.pretrain_steps,
-        pretrain_learning_rate=args.pretrain_learning_rate,
-        pretrain_tolerance=(None if args.skip_pretraining else args.pretrain_tolerance),
-        inversion_epochs=args.inversion_epochs,
-        inversion_learning_rate=args.inversion_learning_rate,
-        training_batch_columns=args.training_batch_columns,
-        wavelength_batch=args.wavelength_batch,
-        synthesis_batch_columns=args.synthesis_batch_columns,
-        stokes_weights=args.stokes_weights,
-        prior_weight=args.prior_weight,
-        fine_tune_base=args.fine_tune_base,
-        seed=args.seed,
-        show_progress=show_progress,
-        wavelength_parallelism=args.wavelength_parallelism,
-        validation_columns=args.validation_columns,
-    )
+        if experiment_logger is not None:
+            experiment_logger.finish(exit_code=0)
     return None
 
 

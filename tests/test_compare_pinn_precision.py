@@ -24,7 +24,6 @@ def _write_worker_fixture(tmp_path, precision, schedule="same-schedule"):
         "diagnostic_loss": np.asarray(0.5 + 0.1 * offset),
         "diagnostic_gradient": gradient + 0.1 * offset,
         "initial_parameters": np.asarray((0.25, -0.5, 0.75)) + 0.01 * offset,
-        "pretrain_loss": np.asarray((2.0, 1.0)) + 0.1 * offset,
         "inversion_loss": np.asarray(((0.8, 0.7, 0.1),)) + 0.01 * offset,
         "validation_loss": np.asarray((0.9, 0.7)) + 0.01 * offset,
         "final_synthetic_stokes": final + offset,
@@ -58,9 +57,7 @@ def _write_worker_fixture(tmp_path, precision, schedule="same-schedule"):
 
 
 def test_array_comparison_uses_fp64_as_the_relative_denominator():
-    actual = comparison.array_comparison(
-        np.asarray((3.0, 4.0)), np.asarray((0.0, 8.0))
-    )
+    actual = comparison.array_comparison(np.asarray((3.0, 4.0)), np.asarray((0.0, 8.0)))
 
     assert actual["max_absolute"] == pytest.approx(4.0)
     assert actual["rmse"] == pytest.approx(np.sqrt(12.5))
@@ -87,9 +84,9 @@ def test_report_contains_speed_accuracy_convergence_and_recovery(tmp_path):
     assert report["reproducibility"]["initialization_seed"] == 9
     assert report["reproducibility"]["inversion_schedule_seed"] == 10
     assert report["speedup_fp64_over_fp32"]["total"] == pytest.approx(6.0)
-    assert report["speedup_fp64_over_fp32"][
-        "gradient_cached_median"
-    ] == pytest.approx(4.0)
+    assert report["speedup_fp64_over_fp32"]["gradient_cached_median"] == pytest.approx(
+        4.0
+    )
 
     spectra = report["comparisons"]["spectra"]["before_inversion"]
     assert spectra["continuum_normalized_max_absolute"] == pytest.approx(0.1)
@@ -100,7 +97,7 @@ def test_report_contains_speed_accuracy_convergence_and_recovery(tmp_path):
     assert 0.99 < gradient["cosine_similarity"] <= 1.0
     assert gradient["relative_l2"] > 0.0
     convergence = report["comparisons"]["convergence"]
-    assert convergence["pretraining"]["fp64"] == [2.0, 1.0]
+    assert "pretraining" not in convergence
     assert convergence["inversion"]["columns"] == ["total", "spectral", "prior"]
     recovered = report["comparisons"]["recovered_atmosphere"]
     assert set(recovered) == set(comparison.ATMOSPHERE_FIELDS)
